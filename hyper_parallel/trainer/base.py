@@ -341,6 +341,15 @@ class BaseTrainer(Stateful, ABC):
         if backend == "hccl" and self.config.training.enable_full_determinism:
             # HCCL reads this when creating communicators, before set_seed runs below.
             os.environ["HCCL_DETERMINISTIC"] = "true"
+        if backend == "fake" and getattr(self.config.accelerator, "pp_size", 1) > 1:
+            # A single fake process only stands for one pipeline stage, so a
+            # "successful" run would silently mean stage 0 alone. Fail fast
+            # instead of implying the full pipeline was exercised.
+            raise ValueError(
+                "training.backend='fake' supports pp_size == 1 only "
+                f"(got accelerator.pp_size={self.config.accelerator.pp_size}). "
+                "Pipeline-parallel questions need a real distributed run."
+            )
         initialize_distributed(backend=backend)
 
         self.local_rank = get_local_rank_safe()

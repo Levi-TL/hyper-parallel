@@ -32,7 +32,10 @@ class TrainingConfig:
     global_batch_size: int = 8
     micro_batch_size: int = 1
 
-    backend: Literal["nccl", "hccl", "gloo"] = "nccl"
+    backend: Literal["nccl", "hccl", "gloo", "fake"] = "nccl"
+    """Distributed backend. "fake" runs a single process with a logical world
+    size (``HP_FAKE_WORLD_SIZE``): compute is real, collectives are no-ops,
+    and pp_size must be 1."""
     max_grad_norm: float = 1.0
     init_device: Literal["meta", "cpu", "cuda", "npu"] = "meta"
     loss_aggregation: Literal["token_weighted", "rank_average"] = "token_weighted"

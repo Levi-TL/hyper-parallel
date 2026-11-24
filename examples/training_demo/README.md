@@ -77,6 +77,38 @@ bash examples/training_demo/qwen3_moe/run_parallel_offline.sh \
 
 Logs and generated data are stored under `output/training_demo`.
 
+## Fake backend: single-process logical-world runs
+
+`training.backend: fake` runs the **same YAML topology in one physical
+process**: kernels, allocator, weights, and data stay real, while collectives
+become local no-ops (no communicator is created). `HP_FAKE_WORLD_SIZE` pins
+the logical world size, and the process stands for logical rank 0.
+
+```bash
+bash examples/training_demo/qwen3_moe/run_fake.sh /path/to/Qwen3-30B-A3B
+```
+
+`run_fake.sh` also enables the allocator memory snapshot
+(`output/training_demo/memory_snapshot/*.pickle`, viewable with
+[PyTorch memory_viz](https://pytorch.org/memory-viz)) and per-step peak
+allocator statistics. Use it to answer, before cluster access, whether a
+parallel configuration starts and how much memory logical rank 0 holds.
+
+What the fake backend proves and does not:
+
+- Proves: configuration/mesh/shape bring-up, the full train step with real
+  kernels, and the rank-local **allocator** memory account (parameters,
+  optimizer state, activations, gradients, fragmentation).
+- Does not prove: throughput or kernel timing, numerical equivalence or
+  real collective behaviour, communication overlap, and pipeline-parallel
+  scheduling (`pp_size > 1` fails fast with an explicit error).
+- The account excludes device-runtime resident memory (HCCL communicator,
+  ~GB-scale per card on real runs) and cross-rank timing interactions; add
+  the environment-specific resident delta when comparing against a real run.
+
+The NPU fake device registration is patched in-process on the fake path only
+(`hyper_parallel/distributed/fake_backend.py`); real HCCL runs are unaffected.
+
 ## Full pretrained model
 
 Both full-model launchers load all 48 layers and the complete Hugging Face

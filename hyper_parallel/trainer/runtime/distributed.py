@@ -113,6 +113,9 @@ def initialize_distributed(backend: str = "nccl") -> Any:
 
     Calls dist.init_process_group if not already initialized.
     Falls back to gloo when the requested backend is unavailable (e.g. CPU).
+    The "fake" backend runs one physical process with a logical world size
+    (``HP_FAKE_WORLD_SIZE``): compute stays real while collectives become
+    local no-ops.
     Sets the current accelerator device from ``LOCAL_RANK`` before process
     group initialization.
     """
@@ -123,7 +126,20 @@ def initialize_distributed(backend: str = "nccl") -> Any:
 
     if not dist.is_initialized():
         effective_backend = backend
-        if backend == "nccl" and device_type == "npu":
+        if backend == "fake":
+            from hyper_parallel.distributed.fake_backend import (
+                ensure_fake_backend_supports_npu,
+                setup_fake_single_process_environment,
+            )
+            logical_world_size = setup_fake_single_process_environment()
+            if device_type == "npu":
+                ensure_fake_backend_supports_npu()
+            logger.info(
+                "Using single-process fake backend: compute is real, "
+                "collectives are local no-ops; logical world size = %s.",
+                logical_world_size,
+            )
+        elif backend == "nccl" and device_type == "npu":
             effective_backend = "hccl"
             logger.info("Using HCCL instead of NCCL on the NPU backend.")
         elif backend == "nccl" and device_type == "cpu":
