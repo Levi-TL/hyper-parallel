@@ -26,6 +26,7 @@ from torch.distributed import _functional_collectives
 
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all, ep_all_to_all_async, ep_exchange_counts, ep_split_sizes,
+    mirror_expert_ids, mirrors_peers,
 )
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
@@ -67,6 +68,13 @@ class EPContext:
         self.num_experts = num_experts
         self.local_experts = num_experts // mesh.size()
         self.rank = mesh.get_local_rank()
+        self._peers_mirror: bool | None = None
+
+    def _mirrored_transport(self) -> bool:
+        """Whether rows come back from peers unchanged (single-process fake backend)."""
+        if self._peers_mirror is None:
+            self._peers_mirror = mirrors_peers(self.mesh.get_group())
+        return self._peers_mirror
 
     def _exchange(self, tensor: Tensor, send: list[int], receive: list[int], *, async_op: bool = False) -> Tensor:
         """Share one synchronous/lazy exchange entry between dispatch and combine."""
@@ -250,6 +258,10 @@ class EPContext:
         asynchronous = self._overlap_ready("fc1")
         hidden = self._exchange(hidden_states.contiguous(), send, receive, async_op=asynchronous)
         global_ids = self._exchange(ids[:, None].contiguous(), send, receive, async_op=asynchronous).reshape(-1)
+        if self.mesh.size() > 1 and self._mirrored_transport():
+            # Nothing arrives from peers, so slots keep naming experts this rank
+            # does not own; the local expert at the same offset stands in.
+            global_ids = mirror_expert_ids(global_ids, self.local_experts, self.rank)
         weights = None
         if routing_weights is not None:
             weights = self._exchange(routing_weights[:, None].contiguous(), send, receive,

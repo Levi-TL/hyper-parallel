@@ -229,6 +229,149 @@ class TestFakeParallelLayout(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is not installed")
+class TestMirroredExpertTransport(unittest.TestCase):
+    """Expert-parallel exchange on the fake backend: peers mirror the local rank.
+
+    torch's FakeProcessGroup leaves all-to-all outputs untouched, so a ragged
+    MoE dispatch cannot learn its receive counts (the internal NPU run failed
+    with "all EP ranks must agree ..."). On a fake group the EP transport hands
+    the sent rows straight back instead. Everything below runs on CPU.
+    """
+
+    NUM_EXPERTS = 8
+    EP_SIZE = 2
+
+    class _Mesh:
+        ndim = 1
+
+        def __init__(self, group):
+            self._group = group
+
+        def size(self):
+            return TestMirroredExpertTransport.EP_SIZE
+
+        def get_local_rank(self):
+            return dist.get_rank(self._group)
+
+        def get_group(self):
+            return self._group
+
+    def setUp(self):
+        self._saved = {key: os.environ.get(key) for key in _SAVED_ENV_KEYS}
+        os.environ[HP_FAKE_WORLD_SIZE] = "8"
+        setup_fake_single_process_environment()
+        dist.init_process_group(backend="fake", rank=0, world_size=8)
+        self._group = dist.new_group(ranks=[0, 1])
+
+    def tearDown(self):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _slots(self):
+        generator = torch.Generator().manual_seed(0)
+        # Expert IDs ascending, as the slot protocol requires; experts 4-7 are
+        # owned by the (absent) peer rank.
+        ids = torch.tensor([0, 2, 3, 5, 6, 7], dtype=torch.int64)
+        hidden = torch.randn(ids.numel(), 4, generator=generator, requires_grad=True)
+        weights = torch.rand(ids.numel(), generator=generator, requires_grad=True)
+        return hidden, ids, weights
+
+    def test_counts_come_back_unchanged_with_flags(self):
+        from hyper_parallel.distributed.expert_parallel.collectives import ep_exchange_counts
+
+        metadata = torch.tensor([[3, 1], [3, 1]], dtype=torch.int64)
+        received = ep_exchange_counts(metadata, self._group)
+        self.assertTrue(torch.equal(received, metadata))
+        self.assertIsNot(received, metadata)
+
+    def test_exchange_is_identity_and_passes_gradients(self):
+        from hyper_parallel.distributed.expert_parallel.collectives import (
+            ep_all_to_all,
+            ep_all_to_all_async,
+        )
+
+        for exchange in (ep_all_to_all, ep_all_to_all_async):
+            with self.subTest(exchange=exchange.__name__):
+                rows = torch.randn(6, 4, requires_grad=True)
+                out = exchange(rows, [4, 2], [4, 2], self._group)
+                self.assertEqual(out.shape, (6, 4))
+                self.assertTrue(torch.equal(out.detach(), rows.detach()))
+                out.sum().backward()
+                self.assertTrue(torch.equal(rows.grad, torch.ones_like(rows)))
+
+    def test_exchange_rejects_mismatched_receive_total(self):
+        from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all
+
+        # A caller whose receive counts came from elsewhere (not the mirrored
+        # count exchange) must fail loudly rather than hand back wrong shapes.
+        with self.assertRaises(ValueError):
+            ep_all_to_all(torch.randn(6, 4), [4, 2], [6, 2], self._group)
+
+    def test_mirrored_ids_stay_inside_local_expert_range(self):
+        from hyper_parallel.distributed.expert_parallel.collectives import mirror_expert_ids
+
+        ids = torch.tensor([0, 2, 3, 5, 6, 7], dtype=torch.int64)
+        for ep_rank in range(self.EP_SIZE):
+            local = mirror_expert_ids(ids, 4, ep_rank)
+            self.assertEqual(int(local.min()), ep_rank * 4)
+            self.assertEqual(int(local.max()), ep_rank * 4 + 3)
+            self.assertTrue(torch.equal(local % 4, ids % 4))
+
+    def test_dispatch_and_combine_keep_every_slot(self):
+        from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
+
+        context = EPContext(
+            self._Mesh(self._group), num_experts=self.NUM_EXPERTS, overlap_shared_expert=False)
+        hidden, ids, weights = self._slots()
+        received, counts, _, send, receive, recv_inverse = context.dispatch(hidden, ids, weights)
+        local_experts = self.NUM_EXPERTS // self.EP_SIZE
+
+        # Row counts are those of a balanced EP run: every slot is computed.
+        self.assertEqual(send, receive)
+        self.assertEqual(tuple(counts.shape), (local_experts,))
+        self.assertEqual(int(counts.sum()), ids.numel())
+        self.assertEqual(received.shape, hidden.shape)
+        self.assertEqual(int(recv_inverse.min()), 0)
+        self.assertEqual(int(recv_inverse.max()), ids.numel() - 1)
+
+        # Identity experts: combine returns each slot's own row, in slot order.
+        returned = context.combine(received, send, receive, recv_inverse)
+        self.assertTrue(torch.equal(returned.detach(), hidden.detach()))
+        returned.sum().backward()
+        self.assertTrue(torch.equal(hidden.grad, torch.ones_like(hidden)))
+
+    def test_legacy_dispatch_folds_onto_local_experts(self):
+        from hyper_parallel.distributed.expert_parallel import experts as ep_experts
+
+        seen = {}
+
+        class _Experts:
+            local_expert_count = self.NUM_EXPERTS // self.EP_SIZE
+
+            def __call__(self, states, indices):
+                seen["indices"] = indices
+                seen["rows"] = states.shape[0]
+                return states
+
+        class _Module:
+            experts = _Experts()
+
+        rows = torch.randn(6, 4)
+        indices = torch.tensor([[0], [2], [3], [5], [6], [7]], dtype=torch.int64)
+        out = ep_experts._run_ep_local_experts(  # pylint: disable=protected-access
+            _Module(), rows, indices, [3, 3], [3, 3], self._group, expert_offset=0)
+        self.assertEqual(out.shape, rows.shape)
+        self.assertEqual(seen["rows"], rows.shape[0])
+        self.assertGreaterEqual(int(seen["indices"].min()), 0)
+        self.assertLess(int(seen["indices"].max()), _Experts.local_expert_count)
+
+
+@unittest.skipUnless(HAS_TORCH, "torch is not installed")
 class TestFakeCheckpoint(unittest.TestCase):
     """DCP save and single-process restore under the fake backend."""
 

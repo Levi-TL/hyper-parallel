@@ -52,6 +52,8 @@ from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
     ep_all_to_all_async,
     ep_split_sizes,
+    mirror_expert_ids,
+    mirrors_peers,
 )
 
 
@@ -408,8 +410,21 @@ def _run_ep_local_experts(
     received_indices = ep_all_to_all(
         dispatched_indices, send_counts, receive_counts, ep_group
     ).squeeze(-1)
+    received_indices = _local_expert_indices(module, received_indices, ep_group)
     local_outputs = module.experts(received_states, received_indices - expert_offset)
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
+
+
+def _local_expert_indices(
+    module: Any, received_indices: torch.Tensor, ep_group: Any
+) -> torch.Tensor:
+    """Fold mirrored rows onto local experts; real transports are returned unchanged."""
+    if not mirrors_peers(ep_group):
+        return received_indices
+    # Single-process fake backend: nothing arrives from peers, so rows still
+    # name their original global experts, including ones this rank does not own.
+    return mirror_expert_ids(
+        received_indices, module.experts.local_expert_count, dist.get_rank(group=ep_group))
 
 
 def _aggregate_ep_outputs(
@@ -631,9 +646,10 @@ def ep_routed_experts_and_combine(
         The routed branch output, shape ``state.output_shape``.
     """
     expert_offset = dist.get_rank(group=ep_group) * module.experts.local_expert_count
+    received_indices = _local_expert_indices(module, state.received_indices, ep_group)
     local_outputs = module.experts(
         state.received_states,
-        state.received_indices - expert_offset)
+        received_indices - expert_offset)
     combined_expert_outputs = ep_all_to_all_async(
         local_outputs.contiguous(), state.receive_counts, state.send_counts, ep_group,
     )

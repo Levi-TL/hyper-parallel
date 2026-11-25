@@ -105,6 +105,14 @@ What the fake backend proves and does not:
 - The account excludes device-runtime resident memory (HCCL communicator,
   ~GB-scale per card on real runs) and cross-rank timing interactions; add
   the environment-specific resident delta when comparing against a real run.
+- Expert parallelism (`ep_size > 1`) runs with **mirrored** token exchange:
+  torch's fake process group leaves all-to-all outputs empty, so on the fake
+  path each peer is assumed to send this rank exactly what this rank sends it,
+  and the local expert at the same offset stands in for a remote one
+  (`hyper_parallel/distributed/expert_parallel/collectives.py`). Row counts,
+  and therefore expert activations and exchange buffers, match a balanced EP
+  run in expectation; routing imbalance between ranks and the loss value do
+  not. This is the same assumption torch's fake `all_gather` makes.
 
 Torch registers its fake backend for `cpu/cuda/hpu` (plus `xpu` from 2.10)
 only, while a process group resolves its backend per collective from the
@@ -114,8 +122,10 @@ verified right after init (`hyper_parallel/distributed/fake_backend.py`).
 Real HCCL runs are unaffected: the default-backend map is never modified.
 
 Not covered by the fake backend: `dataloader.load_balance` (collective loading
-creates real Gloo/HCCL data-plane groups, so it fails fast) and high
-availability (creates real HCCL groups).
+creates real Gloo/HCCL data-plane groups, so it fails fast), high
+availability (creates real HCCL groups), and the Engram module with
+`ep_size > 1` (its count exchange does not use the mirrored transport and
+fails fast with a row-count error).
 
 ## Full pretrained model
 

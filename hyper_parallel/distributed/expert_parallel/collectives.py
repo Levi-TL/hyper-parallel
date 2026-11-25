@@ -21,6 +21,9 @@ other backends that do not support ragged a2a use pad-to-max +
 equivalent (padding only adds filler rows that do not participate in
 computation).
 
+The single-process fake backend takes a third path: peers mirror the local
+rank, so exchanges are the identity on the rows sent (:func:`mirrors_peers`).
+
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
@@ -34,7 +37,43 @@ from hyper_parallel.core.dtensor._utils import differentiable_all_to_all_single_
 from hyper_parallel.core.utils.communication import _is_tracing_or_compiling
 
 _UNEVEN_A2A_BACKENDS = ("nccl", "hccl")
+_FAKE_BACKEND = "fake"
 
+
+def mirrors_peers(group: Any) -> bool:
+    """Whether ``group`` is a single-process fake group whose peers mirror this rank.
+
+    torch's FakeProcessGroup never writes all-to-all outputs, so both the count
+    exchange and the payload exchange would hand back uninitialised buffers and
+    a ragged dispatch could not even learn how many rows it receives. On such a
+    group this module instead treats every peer as a mirror of the local rank:
+    peer ``r`` receives exactly what this rank sends to ``r`` and returns those
+    same rows. That is the assumption torch's own fake ``all_gather`` makes
+    ("assume each rank has the same input").
+
+    Row counts then match a balanced EP run in expectation, so the allocator
+    account keeps expert activations and exchange buffers of the right size.
+    Values are the local rank's own and the loss is not meaningful.
+    """
+    return dist.get_backend(group) == _FAKE_BACKEND
+
+
+def mirror_expert_ids(global_ids: torch.Tensor, local_expert_count: int, ep_rank: int) -> torch.Tensor:
+    """Map each slot's expert onto the local expert at the same offset.
+
+    Needed wherever rows come back through a mirrored transport: nothing
+    arrives from peers, so every slot still names its original global expert,
+    including experts this rank does not own.
+
+    Args:
+        global_ids: Expert IDs of the rows handed back by a mirrored exchange.
+        local_expert_count: Experts owned by each EP rank.
+        ep_rank: This rank's position in the EP group.
+
+    Returns:
+        IDs of local experts, all inside ``[ep_rank * C, (ep_rank + 1) * C)``.
+    """
+    return global_ids % local_expert_count + ep_rank * local_expert_count
 
 
 def ep_exchange_counts(counts: torch.Tensor, group: Any) -> torch.Tensor:
@@ -49,6 +88,8 @@ def ep_exchange_counts(counts: torch.Tensor, group: Any) -> torch.Tensor:
     Returns:
         Counts received from each peer in the same rank order.
     """
+    if mirrors_peers(group):
+        return counts.clone()
     if _is_tracing_or_compiling():
         return _functional_collectives.wait_tensor(
             _functional_collectives.all_to_all_single(counts, None, None, group)
@@ -211,6 +252,56 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         return grad, None, None, None
 
 
+class _EPAllToAllMirrored(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Single-process transport for the fake backend: peers mirror this rank.
+
+    The exchange is the identity on the rows this rank sends: peer ``r`` hands
+    back the chunk addressed to it, so ``sum(recv_counts)`` must equal the
+    number of rows sent. Backward is the identity for the same reason.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        send_counts: list[int],
+        recv_counts: list[int],
+    ) -> torch.Tensor:  # pylint: disable=arguments-differ
+        """Hand the sent rows back as the received ones.
+
+        Args:
+            ctx: Autograd context (unused: nothing is saved).
+            x: Peer-major payload, split along dimension zero.
+            send_counts: Rows addressed to each peer.
+            recv_counts: Rows mirrored peers hand back, one list per peer.
+        """
+        del ctx
+        if sum(send_counts) != x.shape[0]:
+            raise ValueError(
+                f"mirrored all_to_all: send counts sum to {sum(send_counts)} "
+                f"but the payload has {x.shape[0]} rows")
+        if sum(recv_counts) != sum(send_counts):
+            raise ValueError(
+                "mirrored all_to_all: receive counts must sum to the send total "
+                f"({sum(recv_counts)} != {sum(send_counts)}); this caller does not "
+                "support the fake backend yet")
+        return x.contiguous().clone()
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None]:  # pylint: disable=arguments-differ
+        """Return the gradient unchanged, like the forward exchange.
+
+        Args:
+            ctx: Autograd context (unused).
+            grad_output: Gradients of the mirrored rows.
+        """
+        del ctx
+        return grad_output.contiguous(), None, None
+
+
 def ep_all_to_all(
     x: torch.Tensor,
     send_counts: list[int],
@@ -220,7 +311,8 @@ def ep_all_to_all(
     """Unified entry for EP token exchange (autograd-differentiable).
 
     NCCL/HCCL use variable splits. Other backends pad each segment for the exchange.
-    The eager entry returns a materialized tensor. Graph capture records the
+    The fake backend mirrors the local rank (see :func:`mirrors_peers`). The
+    eager entry returns a materialized tensor. Graph capture records the
     functional exchange and its consumer wait.
 
     Args:
@@ -232,6 +324,8 @@ def ep_all_to_all(
     Returns:
         Received payload with sum(recv_counts) rows.
     """
+    if mirrors_peers(group):
+        return _EPAllToAllMirrored.apply(x, send_counts, recv_counts)
     if _is_tracing_or_compiling():
         # Keep the autograd wrapper; its first consumer inserts the stream wait.
         return _functional_collectives.all_to_all_single_autograd(x, recv_counts, send_counts, group)
@@ -255,7 +349,8 @@ def ep_all_to_all_async(
     exchange and that first read therefore overlaps with the in-flight transfer
     (forward and backward alike).
 
-    Backends without that support use the padded blocking exchange.
+    Backends without that support use the padded blocking exchange; the fake
+    backend mirrors the local rank, synchronously (see :func:`mirrors_peers`).
 
     Args:
         x: Input tensor, split along dim 0 by ``send_counts``.
@@ -265,6 +360,8 @@ def ep_all_to_all_async(
     Returns:
         The exchanged rows, materialized lazily on the async path.
     """
+    if mirrors_peers(group):
+        return _EPAllToAllMirrored.apply(x, send_counts, recv_counts)
     if not _backend_supports_uneven_a2a(group):
         return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)
     return differentiable_all_to_all_single_async(x, send_counts, recv_counts, group)
