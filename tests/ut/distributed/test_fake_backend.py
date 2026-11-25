@@ -21,12 +21,12 @@ NPU-only cases self-skip on machines without an NPU runtime.
 
 import os
 import unittest
-from unittest import mock
 
 from hyper_parallel.distributed.fake_backend import (
     HP_FAKE_WORLD_SIZE,
-    ensure_fake_backend_supports_npu,
+    ensure_fake_backend_supports_device,
     setup_fake_single_process_environment,
+    verify_fake_backend_bound,
 )
 
 try:
@@ -131,48 +131,76 @@ class TestFakeProcessGroup(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is not installed")
-class TestNpuRegistrationPatch(unittest.TestCase):
-    """The NPU registration patch must be idempotent and non-destructive."""
+class TestDeviceBinding(unittest.TestCase):
+    """Accelerator binding for the fake backend.
+
+    ``meta`` stands in for ``npu``: binding a backend to a device type needs
+    no hardware, so the NPU failure mode ("No backend type associated with
+    device type npu") is reproduced exactly on a CPU-only machine.
+    """
+
+    STANDIN = "meta"
 
     def setUp(self):
         import hyper_parallel.distributed.fake_backend as fake_backend
+
         self._fake_backend = fake_backend
-        self._saved_patched = fake_backend._NPU_PATCH_APPLIED
+        capability = fake_backend._fake_capability(dist)
+        if capability is None:
+            self.skipTest("this torch build has no fake distributed backend")
+        self._capability = capability
+        self._snapshot = list(capability)
+        fake_backend._PATCHED_DEVICES.discard(self.STANDIN)
+        self._default_map = dict(dist.Backend.default_device_backend_map)
+        self._saved = {key: os.environ.get(key) for key in _SAVED_ENV_KEYS}
+        os.environ[HP_FAKE_WORLD_SIZE] = "8"
+        setup_fake_single_process_environment()
 
     def tearDown(self):
-        self._fake_backend._NPU_PATCH_APPLIED = self._saved_patched
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        # Restore in place: the PG factory reads this very list object.
+        self._capability[:] = self._snapshot
+        self._fake_backend._PATCHED_DEVICES.discard(self.STANDIN)
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
-    def test_does_not_overwrite_existing_npu_mapping(self):
-        device_map = {"cpu": "gloo", "cuda": "nccl", "npu": "hccl"}
-        with mock.patch.object(
-            dist.Backend, "default_device_backend_map", device_map
-        ):
-            self._fake_backend._NPU_PATCH_APPLIED = False
-            self.assertFalse(ensure_fake_backend_supports_npu())
-            self.assertEqual(device_map["npu"], "hccl")
-            # Repeated calls stay non-destructive.
-            self.assertFalse(ensure_fake_backend_supports_npu())
-            self.assertEqual(device_map["npu"], "hccl")
+    def test_appends_device_to_fake_capability_only(self):
+        self.assertNotIn(self.STANDIN, self._capability)
+        self.assertTrue(ensure_fake_backend_supports_device(self.STANDIN))
+        self.assertIn(self.STANDIN, self._capability)
+        # The device -> default backend NAME map must stay untouched: it is
+        # what a real HCCL init consults (pytorch/pytorch#159945).
+        self.assertEqual(dist.Backend.default_device_backend_map, self._default_map)
+        # Idempotent: a second call neither duplicates nor rewrites anything.
+        self.assertTrue(ensure_fake_backend_supports_device(self.STANDIN))
+        self.assertEqual(self._capability.count(self.STANDIN), 1)
 
-    def test_adds_npu_when_absent(self):
-        device_map = {"cpu": "gloo", "cuda": "nccl"}
-        with mock.patch.object(
-            dist.Backend, "default_device_backend_map", device_map
-        ):
-            self._fake_backend._NPU_PATCH_APPLIED = False
-            self.assertTrue(ensure_fake_backend_supports_npu())
-            self.assertEqual(device_map.get("npu"), "fake")
+    def test_default_group_and_subgroup_bind_the_device(self):
+        ensure_fake_backend_supports_device(self.STANDIN)
+        dist.init_process_group(backend="fake", rank=0, world_size=8)
+        self.assertTrue(verify_fake_backend_bound(self.STANDIN))
+        default_group = dist.distributed_c10d._get_default_group()
+        backend = default_group._get_backend(torch.device(self.STANDIN))
+        self.assertIn("Fake", type(backend).__name__)
 
-    def test_idempotent_after_successful_patch(self):
-        device_map = {"cpu": "gloo"}
-        with mock.patch.object(
-            dist.Backend, "default_device_backend_map", device_map
-        ):
-            self._fake_backend._NPU_PATCH_APPLIED = False
-            self.assertTrue(ensure_fake_backend_supports_npu())
-            # Second call short-circuits without touching the map again.
-            self.assertTrue(ensure_fake_backend_supports_npu())
-            self.assertEqual(device_map.get("npu"), "fake")
+        # new_group() without an explicit backend re-reads the same capability
+        # list, so subgroups (mesh axes) bind the device as well.
+        group = dist.new_group(ranks=[0, 1])
+        self.assertEqual(dist.get_backend(group), "fake")
+        subgroup_backend = group._get_backend(torch.device(self.STANDIN))
+        self.assertIn("Fake", type(subgroup_backend).__name__)
+
+    def test_unbound_device_fails_at_init_verification(self):
+        # Without the binding, the PG is created fine but has no backend for
+        # the device: exactly the state the internal NPU run crashed in.
+        dist.init_process_group(backend="fake", rank=0, world_size=8)
+        with self.assertRaises(RuntimeError) as ctx:
+            verify_fake_backend_bound(self.STANDIN)
+        self.assertIn("ensure_fake_backend_supports_device", str(ctx.exception))
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is not installed")

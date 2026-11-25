@@ -241,6 +241,20 @@ def _build_native_sampler_loader(
         raise ValueError("Native BatchSampler balancing requires mesh_context.device_mesh")
     if int(getattr(mesh_context, "pp_size", 1)) != 1:
         raise ValueError("Native BatchSampler balancing does not yet support pipeline parallelism")
+    # Collective loading builds explicit Gloo/HCCL data-plane groups. Inside the
+    # single-process fake world those groups would wait for peers that do not
+    # exist, so refuse up front instead of hanging.
+    import torch.distributed as dist
+
+    if (
+        dist.is_available()
+        and dist.is_initialized()
+        and str(dist.get_backend()).lower() == "fake"
+    ):
+        raise ValueError(
+            "dataloader.load_balance (collective loading) is not supported with "
+            "training.backend='fake': it creates real Gloo/HCCL data-plane groups."
+        )
     # Target exposes its resolved callable only as _target_; inspecting it
     # prevents replacing a second-stage dynamic selector without warning.
     target_callable = getattr(dataloader_target, "_target_", None)

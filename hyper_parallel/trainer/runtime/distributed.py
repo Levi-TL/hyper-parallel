@@ -128,12 +128,18 @@ def initialize_distributed(backend: str = "nccl") -> Any:
         effective_backend = backend
         if backend == "fake":
             from hyper_parallel.distributed.fake_backend import (
-                ensure_fake_backend_supports_npu,
+                ensure_fake_backend_supports_device,
                 setup_fake_single_process_environment,
+                verify_fake_backend_bound,
             )
             logical_world_size = setup_fake_single_process_environment()
-            if device_type == "npu":
-                ensure_fake_backend_supports_npu()
+            # torch binds a PG's backends per device type, and its fake backend
+            # lists cpu/cuda/hpu(/xpu) only. Any other accelerator (npu today)
+            # must be added to that list BEFORE init, otherwise the first
+            # collective raises "No backend type associated with device type".
+            needs_device_binding = device_type not in ("cpu", "cuda")
+            if needs_device_binding:
+                ensure_fake_backend_supports_device(device_type)
             logger.info(
                 "Using single-process fake backend: compute is real, "
                 "collectives are local no-ops; logical world size = %s.",
@@ -148,6 +154,10 @@ def initialize_distributed(backend: str = "nccl") -> Any:
             dist.init_process_group(
                 backend="fake", rank=0, world_size=logical_world_size
             )
+            if needs_device_binding:
+                # Fail here, with the cause, instead of at the first NPU
+                # collective deep inside model construction.
+                verify_fake_backend_bound(device_type)
         else:
             if backend == "nccl" and device_type == "npu":
                 effective_backend = "hccl"

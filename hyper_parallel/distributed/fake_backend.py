@@ -23,20 +23,32 @@ for one logical rank of an arbitrarily sized logical world:
 * collectives dispatched through the PyTorch fake process group return
   immediately-completed work and create no communicator.
 
-The fake backend skips env rendezvous, so ``rank`` and ``world_size`` must be
-passed explicitly to ``dist.init_process_group`` — the environment variables
-alone are NOT enough. Omitting them yields a PG that reports the torch
-argument defaults (rank=-1, world_size=-1) while ``dist.is_initialized()``
-still returns True, which surfaces downstream as
-"world_size must be a positive integer, got -1". Callers must follow
-``dist.init_process_group(backend="fake", rank=0, world_size=<logical>)``
-(the pattern used by Torchtitan's ``init_fake_mode`` and by PyTorch's own
-fake-backend tests).
+Two properties of the PyTorch fake backend are not obvious and are handled
+here:
 
-This module never mutates global backend registration at import time: the
-NPU registration helper is only called on the ``backend == "fake"`` path so a
-real HCCL run is unaffected (see PyTorch issue #159945 for the failure mode
-of eagerly registering fake over a real device backend).
+1. ``rank`` and ``world_size`` must be passed explicitly. The fake backend
+   skips env rendezvous, so ``dist.init_process_group(backend="fake")`` without
+   them yields a PG that reports the torch argument defaults
+   (rank=-1, world_size=-1) while ``dist.is_initialized()`` still returns True,
+   which surfaces downstream as "world_size must be a positive integer, got -1".
+   Callers must use ``init_process_group("fake", rank=0, world_size=<logical>)``
+   (the pattern used by Torchtitan's ``init_fake_mode`` and by PyTorch's own
+   fake-backend tests).
+
+2. A process group resolves its backend per collective from the device type of
+   the input tensors (``group._get_backend(tensor.device)``). The device set a
+   PG binds is read from ``Backend.backend_capability["fake"]`` every time a PG
+   is created, and torch registers ``cpu/cuda/hpu`` (plus ``xpu`` from 2.10) -
+   never ``npu``. A fake PG therefore fails on the first NPU collective with
+   "No backend type associated with device type npu" unless ``npu`` is added to
+   that capability list BEFORE ``init_process_group``. ``new_group`` calls
+   without an explicit backend re-read the same list, so one append covers the
+   default group and every subgroup.
+
+``Backend.default_device_backend_map`` (device -> default backend NAME, used
+only when ``init_process_group`` is called without a backend) is deliberately
+left untouched: overwriting its ``npu`` entry is what broke real HCCL runs in
+pytorch/pytorch#159945.
 """
 
 import logging
@@ -47,13 +59,24 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "HP_FAKE_WORLD_SIZE",
     "setup_fake_single_process_environment",
-    "ensure_fake_backend_supports_npu",
+    "ensure_fake_backend_supports_device",
+    "verify_fake_backend_bound",
 ]
 
 HP_FAKE_WORLD_SIZE = "HP_FAKE_WORLD_SIZE"
 """Environment variable carrying the logical world size of a fake run."""
 
-_NPU_PATCH_APPLIED = False
+_PATCHED_DEVICES: set[str] = set()
+
+# Modules that register the "fake" backend, one per torch layout. Released
+# torch (<= 2.11) registers it on import of the testing module; newer torch
+# registers it through torch.distributed._backends.fake.
+_FAKE_BACKEND_MODULES = (
+    "torch.testing._internal.distributed.fake_pg",
+    "torch.distributed._backends.fake",
+)
+
+_NO_BACKEND_MESSAGE = "No backend type associated with device type"
 
 
 def setup_fake_single_process_environment() -> int:
@@ -87,112 +110,125 @@ def setup_fake_single_process_environment() -> int:
     return logical_world_size
 
 
-def ensure_fake_backend_supports_npu() -> bool:
-    """Make the fake process group usable with NPU tensors.
+def _fake_capability(dist) -> list[str] | None:
+    """Return the mutable device list of the ``fake`` backend, if registered."""
+    capability = getattr(dist.Backend, "backend_capability", None)
+    if not isinstance(capability, dict):
+        return None
+    for name, devices in capability.items():
+        if str(name).lower() == "fake" and isinstance(devices, list):
+            return devices
+    return None
 
-    PyTorch registers the fake backend for ``cpu/cuda/hpu/xpu`` only, so NPU
-    tensors cannot dispatch collectives to a fake process group until ``npu``
-    is added to the device-backend map. The patch is idempotent and scoped to
-    fake runs; a real HCCL run never imports this path, and an existing
-    ``npu`` mapping (e.g. registered by torch_npu) is never overwritten.
+
+def _import_fake_backend_module(dist) -> str | None:
+    """Import whichever module registers ``fake`` in this torch build."""
+    import importlib
+
+    for module_name in _FAKE_BACKEND_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Not this layout (or an incompatible one): try the next one.
+            continue
+        if _fake_capability(dist) is not None:
+            return module_name
+    return None
+
+
+def ensure_fake_backend_supports_device(device_type: str) -> bool:
+    """Bind the fake backend to ``device_type`` (e.g. ``npu``) in this process.
+
+    Appends ``device_type`` to ``Backend.backend_capability["fake"]`` in place.
+    Must run before ``dist.init_process_group(backend="fake", ...)``: that call
+    (and every ``new_group`` without an explicit backend) snapshots the list to
+    decide which device types the PG binds. Idempotent, and scoped to fake
+    runs: real HCCL runs never call it, and the global default-backend map is
+    never modified.
 
     Returns:
-        True when ``npu`` resolves to the fake backend after the call.
+        True when the device type is in the fake capability list afterwards.
     """
-    global _NPU_PATCH_APPLIED
-    if _NPU_PATCH_APPLIED:
+    if device_type in _PATCHED_DEVICES:
         return True
 
     try:
         import torch.distributed as dist
     except ImportError:
         logger.warning(
-            "torch is not installed; the NPU fake-backend registration patch "
-            "is skipped."
+            "torch is not installed; skipping the fake-backend device binding "
+            "for '%s'.",
+            device_type,
         )
         return False
 
-    backend_cls = getattr(dist, "Backend", None)
-    device_map = getattr(backend_cls, "default_device_backend_map", None)
-    if device_map is None:
-        # Unknown layout: let the explicit init_process_group("fake") call
-        # surface whatever error the installed torch raises.
+    if _fake_capability(dist) is None and _import_fake_backend_module(dist) is None:
         logger.warning(
-            "This torch build exposes no Backend.default_device_backend_map; "
-            "skipping the NPU fake-backend registration patch."
+            "This torch build does not register a 'fake' distributed backend; "
+            "cannot bind device type '%s' to it.",
+            device_type,
         )
         return False
 
-    if "npu" in device_map:
-        # torch_npu (or a prior patch) already mapped npu. Overwriting could
-        # break real HCCL init order (pytorch/pytorch#159945), so only align
-        # it when the existing mapping is already fake.
-        _NPU_PATCH_APPLIED = device_map.get("npu") == "fake"
-        return _NPU_PATCH_APPLIED
-
-    # Preferred path: a full registration that carries the fake creator, so
-    # dispatch (not just name resolution) recognises npu tensors.
-    registered = _register_fake_for_npu(backend_cls)
-    if not registered:
-        # Fallback: amend the plain name-resolution map. Explicit
-        # init_process_group("fake") and subgroups inheriting the default
-        # backend resolve through this map when a device is involved.
-        device_map["npu"] = "fake"
-        registered = True
-        logger.info("Mapped device 'npu' to the fake backend via device_backend_map.")
-
-    _NPU_PATCH_APPLIED = registered
-    return registered
+    devices = _fake_capability(dist)
+    if device_type not in devices:
+        devices.append(device_type)
+    _PATCHED_DEVICES.add(device_type)
+    logger.info(
+        "Fake backend bound to device type '%s' (fake capability: %s).",
+        device_type,
+        devices,
+    )
+    return True
 
 
-def _register_fake_for_npu(backend_cls) -> bool:
-    """Re-register the fake backend including ``npu`` in its device list.
+def verify_fake_backend_bound(device_type: str) -> bool:
+    """Check that the default PG really has a backend for ``device_type``.
 
-    Registration details differ across torch versions, so this walks the
-    known module/creator names and treats any mismatch as "not available"
-    rather than an error.
+    Call right after ``init_process_group(backend="fake", ...)``. Turns the
+    failure that would otherwise surface at the first collective on that device
+    ("No backend type associated with device type ...") into an init-time error
+    that names the cause and the fix.
+
+    Returns:
+        True when the backend resolves. False when this torch build does not
+        expose the probe (the run is left to fail or succeed on its own).
+
+    Raises:
+        RuntimeError: The default PG has no backend bound to ``device_type``.
     """
-    import importlib
+    import torch
+    import torch.distributed as dist
 
-    for module_name in ("torch.distributed.fake", "torch.distributed.fake_pg"):
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        creator = _find_fake_creator(module)
-        if creator is None:
-            continue
-        try:
-            backend_cls.register_backend(
-                "fake",
-                creator,
-                devices=["cpu", "cuda", "hpu", "xpu", "npu"],
-            )
-            logger.info(
-                "Registered the fake backend for npu via %s.", module_name
-            )
-            return True
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            logger.warning(
-                "register_backend('fake', ..., devices=[..., 'npu']) failed "
-                "(torch=%s, module=%s): %s. Falling back to the device map.",
-                getattr(importlib.import_module("torch"), "__version__", "?"),
-                module_name,
-                exc,
-            )
-            return False
-    return False
+    default_group = dist.distributed_c10d._get_default_group()
+    try:
+        backend = default_group._get_backend(torch.device(device_type))
+    except RuntimeError as exc:
+        if _NO_BACKEND_MESSAGE in str(exc):
+            raise RuntimeError(
+                f"The fake process group has no backend bound to device type "
+                f"'{device_type}' (torch {torch.__version__}, fake capability "
+                f"{_fake_capability(dist)}). "
+                "ensure_fake_backend_supports_device() must run before "
+                "init_process_group(backend='fake', ...)."
+            ) from exc
+        logger.warning(
+            "Could not verify the fake backend binding for '%s': %s",
+            device_type,
+            exc,
+        )
+        return False
+    except AttributeError:
+        logger.warning(
+            "This torch build does not expose ProcessGroup._get_backend; "
+            "skipping the fake backend binding check for '%s'.",
+            device_type,
+        )
+        return False
 
-
-def _find_fake_creator(module):
-    """Return the fake backend creator callable from a candidate module."""
-    for attr in (
-        "_create_fake_process_group",
-        "create_fake_process_group",
-        "_create_process_group_fake",
-        "_create_fake_backend",
-    ):
-        candidate = getattr(module, attr, None)
-        if callable(candidate):
-            return candidate
-    return None
+    logger.info(
+        "Fake process group: device type '%s' resolves to %s.",
+        device_type,
+        type(backend).__name__,
+    )
+    return True

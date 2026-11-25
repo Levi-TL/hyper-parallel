@@ -106,8 +106,16 @@ What the fake backend proves and does not:
   ~GB-scale per card on real runs) and cross-rank timing interactions; add
   the environment-specific resident delta when comparing against a real run.
 
-The NPU fake device registration is patched in-process on the fake path only
-(`hyper_parallel/distributed/fake_backend.py`); real HCCL runs are unaffected.
+Torch registers its fake backend for `cpu/cuda/hpu` (plus `xpu` from 2.10)
+only, while a process group resolves its backend per collective from the
+device type of the tensors involved. On the fake path, `npu` is therefore
+appended to that device list before `init_process_group` and the binding is
+verified right after init (`hyper_parallel/distributed/fake_backend.py`).
+Real HCCL runs are unaffected: the default-backend map is never modified.
+
+Not covered by the fake backend: `dataloader.load_balance` (collective loading
+creates real Gloo/HCCL data-plane groups, so it fails fast) and high
+availability (creates real HCCL groups).
 
 ## Full pretrained model
 
