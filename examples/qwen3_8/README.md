@@ -19,6 +19,22 @@ GDN 融合算子。三份训练 YAML 通过 `plan_overrides[*].replace.implement
 
 三份配置均通过 `scripts.train_lm` 启动。
 
+## 单进程 fake 档（仿真跑测）
+
+[`run_fake.sh`](run_fake.sh) 以单进程跑 `train_online.yaml`：计算（kernel、allocator、
+权重、数据）真实执行，集合通信为本地空操作。`HP_FAKE_WORLD_SIZE`（默认 8）注入逻辑
+world size，recipe 的并行配置一字不改，单进程代表逻辑 rank 0：
+
+```bash
+./run_fake.sh /path/to/Qwen3.8-27B /path/to/decif-30k.jsonl     --training.train_iters=2 --checkpoint.save_steps=1   # 短冒烟
+```
+
+`--memory.enable=true` 输出 allocator 显存快照与峰值统计（存于
+`outputs/qwen3_8/fake_run/memory_snapshot`）。**边界**：能证明 recipe 在逻辑 8-rank
+拓扑下拉起、rank-local 显存为真实 allocator 实测、DCP checkpoint 可单进程保存；
+不能证明 loss 等价、吞吐、通信重叠或 SPMD 数值正确性（HCCL 常驻显存与通信 buffer
+也不在账上）——这些须升级到真实 8 卡跑测。
+
 ## 1. 实测环境与安装
 
 硬件：8 卡 Ascend 910B3。

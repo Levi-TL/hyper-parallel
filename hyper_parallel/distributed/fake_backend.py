@@ -23,6 +23,16 @@ for one logical rank of an arbitrarily sized logical world:
 * collectives dispatched through the PyTorch fake process group return
   immediately-completed work and create no communicator.
 
+The fake backend skips env rendezvous, so ``rank`` and ``world_size`` must be
+passed explicitly to ``dist.init_process_group`` — the environment variables
+alone are NOT enough. Omitting them yields a PG that reports the torch
+argument defaults (rank=-1, world_size=-1) while ``dist.is_initialized()``
+still returns True, which surfaces downstream as
+"world_size must be a positive integer, got -1". Callers must follow
+``dist.init_process_group(backend="fake", rank=0, world_size=<logical>)``
+(the pattern used by Torchtitan's ``init_fake_mode`` and by PyTorch's own
+fake-backend tests).
+
 This module never mutates global backend registration at import time: the
 NPU registration helper is only called on the ``backend == "fake"`` path so a
 real HCCL run is unaffected (see PyTorch issue #159945 for the failure mode

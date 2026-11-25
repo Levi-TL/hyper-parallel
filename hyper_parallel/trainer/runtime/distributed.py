@@ -139,16 +139,26 @@ def initialize_distributed(backend: str = "nccl") -> Any:
                 "collectives are local no-ops; logical world size = %s.",
                 logical_world_size,
             )
-        elif backend == "nccl" and device_type == "npu":
-            effective_backend = "hccl"
-            logger.info("Using HCCL instead of NCCL on the NPU backend.")
-        elif backend == "nccl" and device_type == "cpu":
-            effective_backend = "gloo"
-            logger.warning(
-                "CUDA not available; falling back to '%s' backend for distributed.",
-                effective_backend,
+            # The fake backend does not run env rendezvous, so rank and
+            # world_size must be passed explicitly. Without them the PG is
+            # created with the torch argument defaults (-1/-1) and every
+            # get_rank()/get_world_size() consumer sees a broken world.
+            # This matches Torchtitan's init_fake_mode() and PyTorch's own
+            # fake-backend tests: init_process_group("fake", rank, world_size).
+            dist.init_process_group(
+                backend="fake", rank=0, world_size=logical_world_size
             )
-        dist.init_process_group(backend=effective_backend)
+        else:
+            if backend == "nccl" and device_type == "npu":
+                effective_backend = "hccl"
+                logger.info("Using HCCL instead of NCCL on the NPU backend.")
+            elif backend == "nccl" and device_type == "cpu":
+                effective_backend = "gloo"
+                logger.warning(
+                    "CUDA not available; falling back to '%s' backend for distributed.",
+                    effective_backend,
+                )
+            dist.init_process_group(backend=effective_backend)
 
     return dist
 

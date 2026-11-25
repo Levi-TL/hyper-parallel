@@ -109,20 +109,22 @@ class TestFakeProcessGroup(unittest.TestCase):
                 os.environ[key] = value
 
     def test_init_reports_logical_world_size(self):
-        dist.init_process_group(backend="fake")
+        # rank/world_size must be explicit: the fake backend skips env
+        # rendezvous and would otherwise default to -1/-1.
+        dist.init_process_group(backend="fake", rank=0, world_size=8)
         self.assertTrue(dist.is_initialized())
         self.assertEqual(dist.get_world_size(), 8)
         self.assertEqual(dist.get_rank(), 0)
 
     def test_collectives_complete_without_communicator(self):
-        dist.init_process_group(backend="fake")
+        dist.init_process_group(backend="fake", rank=0, world_size=8)
         tensor = torch.ones(4)
         dist.all_reduce(tensor)
         self.assertTrue(torch.equal(tensor, torch.ones(4)))
         dist.barrier()
 
     def test_subgroup_creation_inherits_fake_backend(self):
-        dist.init_process_group(backend="fake")
+        dist.init_process_group(backend="fake", rank=0, world_size=8)
         group = dist.new_group(ranks=[0, 1])
         self.assertIsNotNone(group)
         self.assertEqual(dist.get_backend(group), "fake")
@@ -208,7 +210,7 @@ class TestFakeCheckpoint(unittest.TestCase):
         self._saved = {key: os.environ.get(key) for key in _SAVED_ENV_KEYS}
         os.environ[HP_FAKE_WORLD_SIZE] = "1"
         setup_fake_single_process_environment()
-        dist.init_process_group(backend="fake")
+        dist.init_process_group(backend="fake", rank=0, world_size=1)
 
     def tearDown(self):
         if dist.is_initialized():
