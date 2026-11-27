@@ -95,14 +95,19 @@ bash examples/training_demo/qwen3_moe/run_fake.sh /path/to/Qwen3-30B-A3B
 allocator statistics. Use it to answer, before cluster access, whether a
 parallel configuration starts and how much memory logical rank 0 holds.
 
-`HP_FAKE_RANK` selects a **logical** rank, never a physical card: `LOCAL_RANK`
-stays 0, so the process runs on the first visible device whatever rank it
-stands for. To pin the run to a specific card, set
-`ASCEND_RT_VISIBLE_DEVICES=<card>` (it then is device 0 of that process).
-Code that derives a device index from `dist.get_rank()` opens a context on
-another card instead - `npu-smi` then shows one small, allocation-free entry
-per such rank - which is why device resolution goes through the current
-device of the process, not the rank.
+`HP_FAKE_RANK` selects a **logical** rank and `HP_FAKE_DEVICE_ID` (default 0)
+selects the **card** the process occupies; the two are independent, because a
+single process owns a single card. `HP_FAKE_RANK=7 HP_FAKE_DEVICE_ID=3` runs
+rank 7's work (shards, mesh coordinate, checkpoint offsets) on card 3 only:
+`LOCAL_RANK` is set from the device id, never from the rank, so nothing binds
+`npu:7`. The device id indexes the *visible* list, so a narrowed
+`ASCEND_RT_VISIBLE_DEVICES` remaps it (`ASCEND_RT_VISIBLE_DEVICES=3` alone also
+works and makes card 3 device 0 of the process); an id outside that list fails
+at startup with the cause instead of silently landing on another card. Code
+that derives a device index from `dist.get_rank()` would open a context on
+another card instead - `npu-smi` then shows one small, allocation-free entry per
+such rank - which is why device resolution goes through the current device of
+the process, not the rank.
 
 What the fake backend proves and does not:
 

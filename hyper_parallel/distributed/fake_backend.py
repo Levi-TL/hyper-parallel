@@ -27,8 +27,14 @@ for one logical rank of an arbitrarily sized logical world:
   A non-zero logical rank makes the shard ownership, mesh coordinate and
   checkpoint offsets of that rank real, which is what lets a single fake run
   save and reload one rank's shards;
-* ``LOCAL_RANK`` stays 0: there is only one physical device in the process,
-  so binding ``npu:<logical rank>`` would fail on a machine with fewer cards;
+* ``LOCAL_RANK`` names the device this process owns, never the logical rank:
+  pinning ``npu:<logical rank>`` would fail on a machine with fewer cards.
+  ``HP_FAKE_DEVICE_ID`` (default 0) selects that device, so a run can stand
+  for logical rank 7 while occupying card 3. The index follows torch's device
+  numbering, i.e. it indexes the *visible* list, so it means "card 3" only
+  when all cards are visible. Binding a run to a physical card is still
+  ``ASCEND_RT_VISIBLE_DEVICES``; the two knobs compose and a mismatch is
+  rejected instead of silently landing on another card;
 * collectives dispatched through the PyTorch fake process group return
   immediately-completed work and create no communicator.
 
@@ -68,9 +74,11 @@ from hyper_parallel.process_role import is_fake_backend_active  # noqa: F401  (r
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "HP_FAKE_DEVICE_ID",
     "HP_FAKE_RANK",
     "HP_FAKE_WORLD_SIZE",
     "setup_fake_single_process_environment",
+    "resolve_fake_device_id",
     "is_fake_backend_active",
     "ensure_fake_backend_supports_device",
     "verify_fake_backend_bound",
@@ -83,6 +91,16 @@ HP_FAKE_RANK = "HP_FAKE_RANK"
 """Environment variable naming the logical rank a fake run stands for.
 
 Defaults to 0. Must satisfy ``0 <= rank < HP_FAKE_WORLD_SIZE``.
+"""
+
+HP_FAKE_DEVICE_ID = "HP_FAKE_DEVICE_ID"
+"""Environment variable naming the device a fake run occupies.
+
+Defaults to 0. Independent of ``HP_FAKE_RANK``: the logical rank decides which
+shard/mesh coordinate the process owns, the device id decides which card the
+work actually runs on. The value follows torch's device numbering, i.e. it
+indexes the visible device list (``ASCEND_RT_VISIBLE_DEVICES`` /
+``CUDA_VISIBLE_DEVICES`` remap it), and is validated against that list.
 """
 
 _PATCHED_DEVICES: set[str] = set()
@@ -98,21 +116,64 @@ _FAKE_BACKEND_MODULES = (
 _NO_BACKEND_MESSAGE = "No backend type associated with device type"
 
 
+def resolve_fake_device_id(device_count: int | None = None) -> int:
+    """Resolve the device a fake run occupies from ``HP_FAKE_DEVICE_ID``.
+
+    The device id is deliberately independent of the logical rank: a fake run
+    may stand for rank 7 of an 8-rank world (shard ownership, mesh coordinate,
+    checkpoint offsets) while occupying the only card it actually has.
+
+    Args:
+        device_count: Number of devices visible to this process. When given,
+            an id outside ``[0, device_count)`` is rejected with the fix, since
+            the process would otherwise bind a device that does not exist.
+
+    Returns:
+        The device index this process should bind.
+
+    Raises:
+        ValueError: The value is not a non-negative integer, or it is outside
+            the visible device range.
+    """
+    raw = os.environ.get(HP_FAKE_DEVICE_ID, "0")
+    try:
+        device_id = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{HP_FAKE_DEVICE_ID} must be a non-negative integer, got {raw!r}"
+        ) from exc
+    if device_id < 0:
+        raise ValueError(
+            f"{HP_FAKE_DEVICE_ID}={raw!r} must be a non-negative integer."
+        )
+    if device_count is not None and device_id >= device_count:
+        raise ValueError(
+            f"{HP_FAKE_DEVICE_ID}={raw!r} is outside the {device_count} device(s) "
+            "visible to this process. The id indexes the visible list, so a "
+            "narrowed ASCEND_RT_VISIBLE_DEVICES/CUDA_VISIBLE_DEVICES remaps it: "
+            "either point that variable at the card you want, or widen it and "
+            "keep this id."
+        )
+    return device_id
+
+
 def setup_fake_single_process_environment() -> int:
     """Pin this process to one logical rank of a logical world.
 
     When ``HP_FAKE_WORLD_SIZE`` is set, ``WORLD_SIZE`` is overwritten with the
     logical value and ``RANK`` is set to ``HP_FAKE_RANK`` (default 0), while
-    ``LOCAL_RANK`` is pinned to 0 because the process owns exactly one device.
-    The fake backend is single-process by construction, so a stale launcher
-    environment must not leak a physical rank into the logical world.
+    ``LOCAL_RANK`` is set to the device this run owns (``HP_FAKE_DEVICE_ID``,
+    default 0) instead of the logical rank. The fake backend is single-process
+    by construction, so a stale launcher environment must not leak a physical
+    rank into the logical world.
 
     Returns:
         The logical world size the fake process group will report.
 
     Raises:
         ValueError: The world size is not positive, the rank is out of range,
-            or a rank was requested without a matching world size.
+            a rank was requested without a matching world size, or the device
+            id is not a non-negative integer.
     """
     raw = os.environ.get(HP_FAKE_WORLD_SIZE)
     if raw is None:
@@ -145,13 +206,16 @@ def setup_fake_single_process_environment() -> int:
 
     os.environ["WORLD_SIZE"] = str(logical_world_size)
     os.environ["RANK"] = str(logical_rank)
-    os.environ["LOCAL_RANK"] = "0"
+    # LOCAL_RANK selects the device only; it must never follow the logical rank.
+    device_id = resolve_fake_device_id()
+    os.environ["LOCAL_RANK"] = str(device_id)
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29513")
     logger.info(
-        "Fake run stands for logical rank %s of %s.",
+        "Fake run stands for logical rank %s of %s on device %s.",
         logical_rank,
         logical_world_size,
+        device_id,
     )
     return logical_world_size
 

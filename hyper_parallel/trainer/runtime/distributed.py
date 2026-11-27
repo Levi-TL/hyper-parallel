@@ -125,29 +125,44 @@ def initialize_distributed(backend: str = "nccl") -> Any:
     Falls back to gloo when the requested backend is unavailable (e.g. CPU).
     The "fake" backend runs one physical process with a logical world size
     (``HP_FAKE_WORLD_SIZE``): compute stays real while collectives become
-    local no-ops.
-    Sets the current accelerator device from ``LOCAL_RANK`` before process
-    group initialization.
+    local no-ops. Its device is ``HP_FAKE_DEVICE_ID`` (default 0), not the
+    logical rank: one process owns one card.
+    Sets the current accelerator device before process group initialization.
     """
     device_type = get_device_type()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_fake_run = backend == "fake" and not dist.is_initialized()
+    if is_fake_run:
+        from hyper_parallel.distributed.fake_backend import (
+            HP_FAKE_RANK,
+            ensure_fake_backend_supports_device,
+            resolve_fake_device_id,
+            setup_fake_single_process_environment,
+            verify_fake_backend_bound,
+        )
+
+        logical_world_size = setup_fake_single_process_environment()
+        # setup_* wrote HP_FAKE_RANK into RANK, and the *device* index into
+        # LOCAL_RANK. Read the rank back from the env so both stay in sync.
+        logical_rank = int(os.environ.get("RANK", 0))
+        # The device is chosen independently of the logical rank. Validate it
+        # against the visible list here, where the device module is known, so a
+        # run that asks for card 3 while only card 0 is visible fails with the
+        # cause instead of binding a device that does not exist.
+        device_count = (
+            get_torch_device().device_count()
+            if device_type in ("cuda", "npu")
+            else None
+        )
+        local_rank = resolve_fake_device_id(device_count)
+    else:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
     if device_type in ("cuda", "npu"):
         get_torch_device().set_device(local_rank)
 
     if not dist.is_initialized():
         effective_backend = backend
-        if backend == "fake":
-            from hyper_parallel.distributed.fake_backend import (
-                HP_FAKE_RANK,
-                ensure_fake_backend_supports_device,
-                setup_fake_single_process_environment,
-                verify_fake_backend_bound,
-            )
-            logical_world_size = setup_fake_single_process_environment()
-            # setup_* wrote HP_FAKE_RANK (default 0) into RANK, and pinned
-            # LOCAL_RANK to 0: the process owns one device whatever logical
-            # rank it stands for.
-            logical_rank = int(os.environ.get("RANK", 0))
+        if is_fake_run:
             # torch binds a PG's backends per device type, and its fake backend
             # lists cpu/cuda/hpu(/xpu) only. Any other accelerator (npu today)
             # must be added to that list BEFORE init, otherwise the first
@@ -158,9 +173,11 @@ def initialize_distributed(backend: str = "nccl") -> Any:
             logger.info(
                 "Using single-process fake backend: compute is real, "
                 "collectives are local no-ops; logical rank = %s, "
-                "logical world size = %s.",
+                "logical world size = %s, device = %s:%s.",
                 logical_rank,
                 logical_world_size,
+                device_type,
+                local_rank,
             )
             # The fake backend does not run env rendezvous, so rank and
             # world_size must be passed explicitly. Without them the PG is

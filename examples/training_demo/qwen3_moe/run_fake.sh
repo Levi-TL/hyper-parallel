@@ -31,6 +31,11 @@
 #   HP_FAKE_RANK        logical rank this process stands for (default 0, must
 #                       be < HP_FAKE_WORLD_SIZE). Shard ownership, mesh
 #                       coordinate and checkpoint offsets follow it.
+#   HP_FAKE_DEVICE_ID   card this process occupies (default 0), independent of
+#                       HP_FAKE_RANK: `HP_FAKE_RANK=7 HP_FAKE_DEVICE_ID=3`
+#                       simulates rank 7 while running on card 3 only. The id
+#                       indexes the visible list, so a narrowed
+#                       ASCEND_RT_VISIBLE_DEVICES remaps it.
 
 set -euo pipefail
 
@@ -67,15 +72,17 @@ fi
 # 1. training.backend=fake         -> collectives become local no-ops
 # 2. HP_FAKE_WORLD_SIZE            -> logical world size (default 8)
 # 3. HP_FAKE_RANK                  -> logical rank this process stands for
-#    (default 0). LOCAL_RANK stays 0: one process, one physical device.
-# 4. memory.enable / mem_info      -> allocator snapshot (pickle) + peak stats
+#    (default 0).
+# 4. HP_FAKE_DEVICE_ID             -> card this process occupies (default 0).
+#    Not derived from the logical rank: one process, one card.
+# 5. memory.enable / mem_info      -> allocator snapshot (pickle) + peak stats
 #    (per-step allocator accounting is real; NPU/HCCL resident memory is not
 #     included - see examples/training_demo/README.md, "fake backend" section)
 # -----------------------------------------------------------------------------
 
 HP_FAKE_WORLD_SIZE="${HP_FAKE_WORLD_SIZE:-8}" \
 HP_FAKE_RANK="${HP_FAKE_RANK:-0}" \
-LOCAL_RANK=0 \
+HP_FAKE_DEVICE_ID="${HP_FAKE_DEVICE_ID:-0}" \
 python -m examples.training_demo.train_text \
     "${SCRIPT_DIR}/train_parallel_online.yaml" \
     --model.config_path="${MODEL_PATH}" \

@@ -23,10 +23,12 @@ import os
 import unittest
 
 from hyper_parallel.distributed.fake_backend import (
+    HP_FAKE_DEVICE_ID,
     HP_FAKE_RANK,
     HP_FAKE_WORLD_SIZE,
     ensure_fake_backend_supports_device,
     is_fake_backend_active,
+    resolve_fake_device_id,
     setup_fake_single_process_environment,
     verify_fake_backend_bound,
 )
@@ -49,6 +51,7 @@ class TestFakeEnvironment(unittest.TestCase):
         self._saved = {key: os.environ.get(key) for key in _SAVED_ENV_KEYS}
         os.environ.pop(HP_FAKE_WORLD_SIZE, None)
         os.environ.pop(HP_FAKE_RANK, None)
+        os.environ.pop(HP_FAKE_DEVICE_ID, None)
 
     def tearDown(self):
         for key, value in self._saved.items():
@@ -118,6 +121,36 @@ class TestFakeEnvironment(unittest.TestCase):
         os.environ[HP_FAKE_RANK] = "3"
         with self.assertRaises(ValueError):
             setup_fake_single_process_environment()
+
+    def test_device_id_is_independent_of_logical_rank(self):
+        # Standing for rank 7 must not force card 7: one process, one card.
+        os.environ[HP_FAKE_WORLD_SIZE] = "8"
+        os.environ[HP_FAKE_RANK] = "7"
+        os.environ[HP_FAKE_DEVICE_ID] = "3"
+        setup_fake_single_process_environment()
+        self.assertEqual(os.environ["RANK"], "7")
+        self.assertEqual(os.environ["LOCAL_RANK"], "3")
+
+    def test_device_id_defaults_to_zero(self):
+        os.environ[HP_FAKE_WORLD_SIZE] = "8"
+        os.environ[HP_FAKE_RANK] = "5"
+        setup_fake_single_process_environment()
+        self.assertEqual(os.environ["LOCAL_RANK"], "0")
+
+    def test_rejects_negative_or_non_integer_device_id(self):
+        os.environ[HP_FAKE_WORLD_SIZE] = "8"
+        for bad in ("-1", "three"):
+            os.environ[HP_FAKE_DEVICE_ID] = bad
+            with self.assertRaises(ValueError):
+                setup_fake_single_process_environment()
+
+    def test_rejects_device_id_outside_visible_devices(self):
+        # The id indexes the visible list, so a narrowed
+        # ASCEND_RT_VISIBLE_DEVICES makes card 3 unreachable.
+        os.environ[HP_FAKE_DEVICE_ID] = "3"
+        with self.assertRaises(ValueError):
+            resolve_fake_device_id(device_count=1)
+        self.assertEqual(resolve_fake_device_id(device_count=8), 3)
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is not installed")
