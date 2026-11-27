@@ -29,6 +29,7 @@ import torch.distributed as dist
 
 from hyper_parallel.high_availability.group_registry import is_recovery_enabled
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.process_role import is_main_process
 
 logger = get_dataset_logger(__name__)
 
@@ -141,7 +142,11 @@ def _discover_indexed_paths(
         return _walk_data_directories([current_path], file_suffix)
 
     root_layout = None
-    if rank == 0:
+    # The walker must exist even when this process stands for a non-zero
+    # logical rank: a fake run is the only process, and all_gather_object
+    # there returns this rank's own input, so a None layout would propagate
+    # to every slot and leave rank_zero_layout empty.
+    if rank == 0 or is_main_process():
         subdirectories = []
         top_files = []
         for name in os.listdir(current_path):

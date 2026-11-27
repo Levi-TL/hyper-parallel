@@ -30,18 +30,21 @@ import os
 import sys
 import warnings
 
-import torch.distributed as dist
 import transformers
+
+from hyper_parallel.process_role import is_main_process
 
 
 logger = builtin_logging.getLogger(__name__)
 
 
 def _is_rank_0() -> bool:
-    """True if global rank 0 (or distributed not initialized)."""
-    if dist.is_initialized():
-        return dist.get_rank() == 0
-    return True
+    """True for the process that owns global side effects.
+
+    Not literally rank 0: a fake run has one process, which must keep logging
+    even while standing for a non-zero logical rank.
+    """
+    return is_main_process()
 
 
 def setup_logging() -> None:
@@ -53,8 +56,8 @@ def setup_logging() -> None:
 
 
 def _info_rank0(message: str) -> None:
-    """Log an informational message on global rank zero."""
-    if not dist.is_initialized() or dist.get_rank() == 0:
+    """Log an informational message on the main process."""
+    if is_main_process():
         logger.info(message)
 
 

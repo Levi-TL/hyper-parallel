@@ -23,8 +23,10 @@ import os
 import unittest
 
 from hyper_parallel.distributed.fake_backend import (
+    HP_FAKE_RANK,
     HP_FAKE_WORLD_SIZE,
     ensure_fake_backend_supports_device,
+    is_fake_backend_active,
     setup_fake_single_process_environment,
     verify_fake_backend_bound,
 )
@@ -46,6 +48,7 @@ class TestFakeEnvironment(unittest.TestCase):
     def setUp(self):
         self._saved = {key: os.environ.get(key) for key in _SAVED_ENV_KEYS}
         os.environ.pop(HP_FAKE_WORLD_SIZE, None)
+        os.environ.pop(HP_FAKE_RANK, None)
 
     def tearDown(self):
         for key, value in self._saved.items():
@@ -89,6 +92,33 @@ class TestFakeEnvironment(unittest.TestCase):
         with self.assertRaises(ValueError):
             setup_fake_single_process_environment()
 
+    def test_rank_injection_selects_logical_rank(self):
+        # The logical rank decides shard ownership and checkpoint offsets, so
+        # a fake run must be able to stand for any rank of the logical world.
+        os.environ[HP_FAKE_WORLD_SIZE] = "8"
+        os.environ[HP_FAKE_RANK] = "5"
+        os.environ["LOCAL_RANK"] = "3"
+        self.assertEqual(setup_fake_single_process_environment(), 8)
+        self.assertEqual(os.environ["RANK"], "5")
+        # One physical device per process: LOCAL_RANK must not follow the
+        # logical rank, or the process binds npu:5 on a smaller machine.
+        self.assertEqual(os.environ["LOCAL_RANK"], "0")
+
+    def test_rejects_rank_outside_logical_world(self):
+        os.environ[HP_FAKE_WORLD_SIZE] = "4"
+        for bad in ("4", "-1", "9"):
+            os.environ[HP_FAKE_RANK] = bad
+            with self.assertRaises(ValueError):
+                setup_fake_single_process_environment()
+
+    def test_rejects_rank_without_world_size(self):
+        # A rank with no world size cannot be range-checked, so it is a
+        # configuration error rather than a silent fallback to rank 0.
+        os.environ.pop(HP_FAKE_WORLD_SIZE, None)
+        os.environ[HP_FAKE_RANK] = "3"
+        with self.assertRaises(ValueError):
+            setup_fake_single_process_environment()
+
 
 @unittest.skipUnless(HAS_TORCH, "torch is not installed")
 class TestFakeProcessGroup(unittest.TestCase):
@@ -115,6 +145,14 @@ class TestFakeProcessGroup(unittest.TestCase):
         self.assertTrue(dist.is_initialized())
         self.assertEqual(dist.get_world_size(), 8)
         self.assertEqual(dist.get_rank(), 0)
+
+    def test_init_accepts_non_zero_logical_rank(self):
+        # PyTorch's _create_fake_pg forwards group_rank/group_size verbatim,
+        # so a single process can stand for any rank of the logical world.
+        dist.init_process_group(backend="fake", rank=5, world_size=8)
+        self.assertEqual(dist.get_rank(), 5)
+        self.assertEqual(dist.get_world_size(), 8)
+        self.assertTrue(is_fake_backend_active())
 
     def test_collectives_complete_without_communicator(self):
         dist.init_process_group(backend="fake", rank=0, world_size=8)

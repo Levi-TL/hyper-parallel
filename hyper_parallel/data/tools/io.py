@@ -61,6 +61,7 @@ import torch
 from hyper_parallel.high_availability.group_registry import is_recovery_reboot
 from hyper_parallel.data.constants import INDEX_HEADER, INDEX_VERSION, MSC_PREFIX, S3_PREFIX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
+from hyper_parallel.process_role import is_main_process
 
 logger = get_dataset_logger(__name__)
 
@@ -177,7 +178,10 @@ def _cache_index_file(remote_path: str, local_path: str) -> None:
     reboot = is_recovery_reboot()
     torch_dist_enabled = torch.distributed.is_initialized() and not reboot
     rank = torch.distributed.get_rank() if torch_dist_enabled else 0
-    if not os.path.exists(local_path) and rank == 0:
+    # The download must happen even when this process stands for a non-zero
+    # logical rank: a fake run is the only process, so nobody else can fetch
+    # the shared index file.
+    if not os.path.exists(local_path) and (rank == 0 or is_main_process()):
         directory = os.path.dirname(local_path) or "."
         os.makedirs(directory, exist_ok=True)
         if reboot:

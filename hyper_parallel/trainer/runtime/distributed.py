@@ -102,8 +102,18 @@ def get_global_rank_safe() -> int:
 
 
 def get_local_rank_safe() -> int:
-    """Return dist.get_node_local_rank() if initialized, else 0."""
+    """Return the device-local rank: env ``LOCAL_RANK`` under the fake backend.
+
+    ``get_node_local_rank()`` derives a rank from the process group's own rank,
+    so a fake run standing for logical rank 5 would report 5 and try to bind
+    ``npu:5`` on a machine that may only have one card. A fake run has exactly
+    one physical device, which is the one ``LOCAL_RANK`` names.
+    """
     if dist.is_initialized():
+        from hyper_parallel.process_role import is_fake_backend_active
+
+        if is_fake_backend_active():
+            return int(os.environ.get("LOCAL_RANK", 0))
         return dist.get_node_local_rank()
     return 0
 
@@ -128,11 +138,16 @@ def initialize_distributed(backend: str = "nccl") -> Any:
         effective_backend = backend
         if backend == "fake":
             from hyper_parallel.distributed.fake_backend import (
+                HP_FAKE_RANK,
                 ensure_fake_backend_supports_device,
                 setup_fake_single_process_environment,
                 verify_fake_backend_bound,
             )
             logical_world_size = setup_fake_single_process_environment()
+            # setup_* wrote HP_FAKE_RANK (default 0) into RANK, and pinned
+            # LOCAL_RANK to 0: the process owns one device whatever logical
+            # rank it stands for.
+            logical_rank = int(os.environ.get("RANK", 0))
             # torch binds a PG's backends per device type, and its fake backend
             # lists cpu/cuda/hpu(/xpu) only. Any other accelerator (npu today)
             # must be added to that list BEFORE init, otherwise the first
@@ -142,7 +157,9 @@ def initialize_distributed(backend: str = "nccl") -> Any:
                 ensure_fake_backend_supports_device(device_type)
             logger.info(
                 "Using single-process fake backend: compute is real, "
-                "collectives are local no-ops; logical world size = %s.",
+                "collectives are local no-ops; logical rank = %s, "
+                "logical world size = %s.",
+                logical_rank,
                 logical_world_size,
             )
             # The fake backend does not run env rendezvous, so rank and
@@ -151,9 +168,18 @@ def initialize_distributed(backend: str = "nccl") -> Any:
             # get_rank()/get_world_size() consumer sees a broken world.
             # This matches Torchtitan's init_fake_mode() and PyTorch's own
             # fake-backend tests: init_process_group("fake", rank, world_size).
+            # A non-zero rank is intentional: it makes that rank's shard
+            # ownership and checkpoint offsets real inside the single process.
             dist.init_process_group(
-                backend="fake", rank=0, world_size=logical_world_size
+                backend="fake", rank=logical_rank, world_size=logical_world_size
             )
+            if dist.get_rank() != logical_rank:
+                raise RuntimeError(
+                    f"The fake process group reports rank {dist.get_rank()} "
+                    f"but logical rank {logical_rank} was requested "
+                    f"({HP_FAKE_RANK}={os.environ.get(HP_FAKE_RANK, '0')!r}). "
+                    "Check the torch fake-backend registration."
+                )
             if needs_device_binding:
                 # Fail here, with the cause, instead of at the first NPU
                 # collective deep inside model construction.

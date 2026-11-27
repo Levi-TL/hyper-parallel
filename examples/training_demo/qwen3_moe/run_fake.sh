@@ -18,9 +18,9 @@
 #
 # Compute (kernels, allocator, weights, data) is real; collectives are
 # local no-ops. HP_FAKE_WORLD_SIZE keeps the parallel configuration of the
-# YAML unchanged while one process stands for logical rank 0 of the logical
-# world, so a single device (or even CPU for a smoke run) can exercise the
-# full training step of an 8-rank topology.
+# YAML unchanged while one process stands for one logical rank of that world
+# (HP_FAKE_RANK, default 0), so a single device (or even CPU for a smoke run)
+# can exercise the full training step of an 8-rank topology.
 #
 # Usage:
 #   ./run_fake.sh /path/to/Qwen3-30B-A3B [trainer overrides...]
@@ -28,6 +28,9 @@
 # Environment:
 #   HP_FAKE_WORLD_SIZE  logical world size (default 8, matching the YAML
 #                       tp2 x cp2 x ep2 x dp2 topology)
+#   HP_FAKE_RANK        logical rank this process stands for (default 0, must
+#                       be < HP_FAKE_WORLD_SIZE). Shard ownership, mesh
+#                       coordinate and checkpoint offsets follow it.
 
 set -euo pipefail
 
@@ -63,13 +66,16 @@ fi
 # --- fake-backend switches ---------------------------------------------------
 # 1. training.backend=fake         -> collectives become local no-ops
 # 2. HP_FAKE_WORLD_SIZE            -> logical world size (default 8)
-# 3. memory.enable / mem_info      -> allocator snapshot (pickle) + peak stats
+# 3. HP_FAKE_RANK                  -> logical rank this process stands for
+#    (default 0). LOCAL_RANK stays 0: one process, one physical device.
+# 4. memory.enable / mem_info      -> allocator snapshot (pickle) + peak stats
 #    (per-step allocator accounting is real; NPU/HCCL resident memory is not
 #     included - see examples/training_demo/README.md, "fake backend" section)
 # -----------------------------------------------------------------------------
 
 HP_FAKE_WORLD_SIZE="${HP_FAKE_WORLD_SIZE:-8}" \
-RANK=0 LOCAL_RANK=0 \
+HP_FAKE_RANK="${HP_FAKE_RANK:-0}" \
+LOCAL_RANK=0 \
 python -m examples.training_demo.train_text \
     "${SCRIPT_DIR}/train_parallel_online.yaml" \
     --model.config_path="${MODEL_PATH}" \

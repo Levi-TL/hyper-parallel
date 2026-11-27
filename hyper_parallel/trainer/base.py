@@ -52,6 +52,7 @@ from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
+from hyper_parallel.process_role import is_main_process
 from hyper_parallel.trainer.config import (
     OptimizerSwapConfig,
     TrainerConfig,
@@ -361,7 +362,7 @@ class BaseTrainer(Stateful, ABC):
         if self.config.training.seed is None:
             self.config.training.seed = self.default_seed
 
-        if self.global_rank == 0:
+        if is_main_process():
             logger.info(
                 "Trainer config:\n%s",
                 json.dumps(self.config.to_dict(), indent=2),
@@ -393,8 +394,10 @@ class BaseTrainer(Stateful, ABC):
         if self.local_rank == 0:
             enable_third_party_logging()
 
-        # Save arguments
-        if self.global_rank == 0:
+        # Save arguments. A fake run stands for one logical rank but is the
+        # only process, so it must still write the config even when that
+        # logical rank is not 0.
+        if is_main_process():
             save_configs(self.config, self.config.checkpoint.checkpoint_dir)
 
     def _build_model(self) -> None:
@@ -420,7 +423,7 @@ class BaseTrainer(Stateful, ABC):
             fp32_main_params=self.config.optimizer.fp32_main_params,
         )
         self.model_config = self.model.config
-        if self.global_rank == 0:
+        if is_main_process():
             logger.info(
                 "Model config:\n%s",
                 json.dumps(self.model.config.to_dict(), indent=2),

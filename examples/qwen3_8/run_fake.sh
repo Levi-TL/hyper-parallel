@@ -19,8 +19,8 @@
 # Compute (kernels, allocator, weights, data) is real; collectives are local
 # no-ops. HP_FAKE_WORLD_SIZE keeps the recipe's parallel configuration
 # (FSDP dp_shard=8 x cp=2 on 8 ranks) unchanged while one process stands for
-# logical rank 0 of the logical world, so a single device exercises the full
-# training step of the 8-rank topology.
+# one logical rank of that world (HP_FAKE_RANK, default 0), so a single device
+# exercises the full training step of the 8-rank topology.
 #
 # Usage:
 #   ./run_fake.sh /path/to/Qwen3.8-27B /path/to/decif-30k.jsonl [overrides...]
@@ -28,6 +28,12 @@
 # Environment:
 #   HP_FAKE_WORLD_SIZE          logical world size (default 8, matching the
 #                               recipe's FSDP+CP topology)
+#   HP_FAKE_RANK                logical rank this process stands for (default
+#                               0, must be < HP_FAKE_WORLD_SIZE). Rank-local
+#                               shard ownership, mesh coordinate and
+#                               checkpoint offsets follow it, so
+#                               `HP_FAKE_RANK=3 ./run_fake.sh ...` exercises
+#                               rank 3's shards on the single visible device.
 #   ASCEND_RT_VISIBLE_DEVICES   NPU visible to this process (default 0)
 #
 # Typical overrides (recipe defaults are train_iters=100, save_steps=10):
@@ -70,11 +76,14 @@ cd "${PROJECT_ROOT}"
 mkdir -p "${OUTPUT_DIR}"
 
 # --- fake-backend switches ---------------------------------------------------
-# 1. training.backend=fake         -> collectives become local no-ops; rank 0
-#    and world_size 8 are passed explicitly to init_process_group (the fake
-#    backend skips env rendezvous, so env vars alone would yield -1/-1).
+# 1. training.backend=fake         -> collectives become local no-ops; the
+#    logical rank/world_size are passed explicitly to init_process_group (the
+#    fake backend skips env rendezvous, so env vars alone would yield -1/-1).
 # 2. HP_FAKE_WORLD_SIZE            -> logical world size (default 8).
-# 3. memory.enable / mem_info      -> allocator snapshot (pickle) + peak stats
+# 3. HP_FAKE_RANK                  -> logical rank this process stands for
+#    (default 0). LOCAL_RANK stays 0: the process owns one physical device, so
+#    it must not bind npu:<logical rank>.
+# 4. memory.enable / mem_info      -> allocator snapshot (pickle) + peak stats
 #    (per-step allocator accounting is real; NPU/HCCL resident memory and
 #     communication buffers are NOT included - expect that gap vs a real
 #     8-card run; see the README "fake backend" notes in
@@ -86,7 +95,8 @@ export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-1800}
 
 HP_FAKE_WORLD_SIZE="${HP_FAKE_WORLD_SIZE:-8}" \
-RANK=0 LOCAL_RANK=0 \
+HP_FAKE_RANK="${HP_FAKE_RANK:-0}" \
+LOCAL_RANK=0 \
 python3 -m scripts.train_lm \
     "${PROJECT_ROOT}/hyper_parallel/models/qwen3_8/recipes/train_online.yaml" \
     --model.pretrained_model_name_or_path="${MODEL_PATH}" \

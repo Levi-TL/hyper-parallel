@@ -19,7 +19,16 @@ replacing collectives with local no-ops. It lets one physical process stand
 for one logical rank of an arbitrarily sized logical world:
 
 * ``WORLD_SIZE`` is a logical value injected via ``HP_FAKE_WORLD_SIZE``;
-* ``RANK`` / ``LOCAL_RANK`` are pinned to 0 (single process);
+* ``RANK`` is the logical rank this process stands for, injected via
+  ``HP_FAKE_RANK`` (default 0). PyTorch's fake backend is built for exactly
+  this ("run a single rank with a fake process group without needing multiple
+  processes (simulates per-rank behavior)"): ``_create_fake_pg`` forwards the
+  requested ``group_rank``/``group_size`` unchanged, so any rank is valid.
+  A non-zero logical rank makes the shard ownership, mesh coordinate and
+  checkpoint offsets of that rank real, which is what lets a single fake run
+  save and reload one rank's shards;
+* ``LOCAL_RANK`` stays 0: there is only one physical device in the process,
+  so binding ``npu:<logical rank>`` would fail on a machine with fewer cards;
 * collectives dispatched through the PyTorch fake process group return
   immediately-completed work and create no communicator.
 
@@ -54,17 +63,27 @@ pytorch/pytorch#159945.
 import logging
 import os
 
+from hyper_parallel.process_role import is_fake_backend_active  # noqa: F401  (re-exported)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "HP_FAKE_RANK",
     "HP_FAKE_WORLD_SIZE",
     "setup_fake_single_process_environment",
+    "is_fake_backend_active",
     "ensure_fake_backend_supports_device",
     "verify_fake_backend_bound",
 ]
 
 HP_FAKE_WORLD_SIZE = "HP_FAKE_WORLD_SIZE"
 """Environment variable carrying the logical world size of a fake run."""
+
+HP_FAKE_RANK = "HP_FAKE_RANK"
+"""Environment variable naming the logical rank a fake run stands for.
+
+Defaults to 0. Must satisfy ``0 <= rank < HP_FAKE_WORLD_SIZE``.
+"""
 
 _PATCHED_DEVICES: set[str] = set()
 
@@ -80,21 +99,34 @@ _NO_BACKEND_MESSAGE = "No backend type associated with device type"
 
 
 def setup_fake_single_process_environment() -> int:
-    """Pin this process to logical rank 0 of a logical world.
+    """Pin this process to one logical rank of a logical world.
 
     When ``HP_FAKE_WORLD_SIZE`` is set, ``WORLD_SIZE`` is overwritten with the
-    logical value and ``RANK`` / ``LOCAL_RANK`` are pinned to 0: the fake
-    backend is single-process by construction, so a stale launcher
+    logical value and ``RANK`` is set to ``HP_FAKE_RANK`` (default 0), while
+    ``LOCAL_RANK`` is pinned to 0 because the process owns exactly one device.
+    The fake backend is single-process by construction, so a stale launcher
     environment must not leak a physical rank into the logical world.
 
     Returns:
         The logical world size the fake process group will report.
+
+    Raises:
+        ValueError: The world size is not positive, the rank is out of range,
+            or a rank was requested without a matching world size.
     """
     raw = os.environ.get(HP_FAKE_WORLD_SIZE)
     if raw is None:
         # No explicit injection: honour whatever WORLD_SIZE the launcher set
         # (1 when the script runs bare), which keeps plain single-process use
-        # and torchrun-launched fake debugging both working.
+        # and torchrun-launched fake debugging both working. A rank without a
+        # world size is ambiguous - the rank range cannot be validated - so
+        # reject it instead of silently pinning rank 0.
+        requested_rank = os.environ.get(HP_FAKE_RANK)
+        if requested_rank not in (None, "", "0"):
+            raise ValueError(
+                f"{HP_FAKE_RANK}={requested_rank!r} requires "
+                f"{HP_FAKE_WORLD_SIZE} to be set as well."
+            )
         return int(os.environ.get("WORLD_SIZE", "1"))
 
     logical_world_size = int(raw)
@@ -102,11 +134,25 @@ def setup_fake_single_process_environment() -> int:
         raise ValueError(
             f"{HP_FAKE_WORLD_SIZE} must be a positive integer, got {raw!r}"
         )
+
+    rank_raw = os.environ.get(HP_FAKE_RANK, "0")
+    logical_rank = int(rank_raw)
+    if not 0 <= logical_rank < logical_world_size:
+        raise ValueError(
+            f"{HP_FAKE_RANK}={rank_raw!r} is out of range for a logical world "
+            f"of size {logical_world_size}."
+        )
+
     os.environ["WORLD_SIZE"] = str(logical_world_size)
-    os.environ["RANK"] = "0"
+    os.environ["RANK"] = str(logical_rank)
     os.environ["LOCAL_RANK"] = "0"
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29513")
+    logger.info(
+        "Fake run stands for logical rank %s of %s.",
+        logical_rank,
+        logical_world_size,
+    )
     return logical_world_size
 
 
