@@ -440,13 +440,19 @@ def _calc_shard_linear_idx(shard_coord: list[int], shard_size: list[int]) -> int
 
 
 def _resolve_device():
+    """Return the device this process owns for RNG state.
+
+    The tracker keeps its state on the device the process actually runs on.
+    ``dist.get_rank() % device_count`` was used as that device before, which
+    coincides with the local device only on a homogeneous single-node job: a
+    process that stands for an arbitrary logical rank (the fake backend, where
+    rank 7 opens a context on ``npu:7``) or a node whose card count differs from
+    the per-node rank span lands on someone else's device. ``initialize_distributed``
+    binds ``LOCAL_RANK`` before any DTensor op runs, so the current device of the
+    device module is authoritative here.
+    """
     device_handle = _utils.get_device_handle()
-    device_idx = dist.get_rank() % _utils.device_count(device_handle)
-
-    def get_device(device_idx):
-        return _utils.device(device_idx)
-
-    return get_device(device_idx)
+    return _utils.device(device_handle.current_device())
 
 
 def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:

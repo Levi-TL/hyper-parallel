@@ -1054,11 +1054,17 @@ def _broadcast_schema_per_fqn(
 
 
 def _get_local_device() -> torch.device:
-    """Get the device for the current local rank."""
-    local_rank = dist.get_rank() if dist.is_initialized() else 0
+    """Return the device this process owns.
+
+    ``dist.get_rank()`` is the logical rank of the process in the whole job, not
+    a device index: on the second node rank 8 would name ``npu:8``, which does
+    not exist, and a fake run standing for logical rank 7 on a single card would
+    open a context on ``npu:7`` and stage its optimizer broadcast there. The
+    device is whatever ``set_device(LOCAL_RANK)`` bound for this process.
+    """
     if torch.npu.is_available():
-        return torch.device(f"npu:{local_rank}")
-    return torch.device(f"cuda:{local_rank}")
+        return torch.device("npu", torch.npu.current_device())
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 def _broadcast_scalar_entry(

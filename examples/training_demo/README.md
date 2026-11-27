@@ -95,6 +95,15 @@ bash examples/training_demo/qwen3_moe/run_fake.sh /path/to/Qwen3-30B-A3B
 allocator statistics. Use it to answer, before cluster access, whether a
 parallel configuration starts and how much memory logical rank 0 holds.
 
+`HP_FAKE_RANK` selects a **logical** rank, never a physical card: `LOCAL_RANK`
+stays 0, so the process runs on the first visible device whatever rank it
+stands for. To pin the run to a specific card, set
+`ASCEND_RT_VISIBLE_DEVICES=<card>` (it then is device 0 of that process).
+Code that derives a device index from `dist.get_rank()` opens a context on
+another card instead - `npu-smi` then shows one small, allocation-free entry
+per such rank - which is why device resolution goes through the current
+device of the process, not the rank.
+
 What the fake backend proves and does not:
 
 - Proves: configuration/mesh/shape bring-up, the full train step with real

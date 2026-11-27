@@ -215,18 +215,33 @@ class TestResolveDevice(unittest.TestCase):
     """Tests for ResolveDevice."""
     @patch("hyper_parallel.core.dtensor.random.dist")
     @patch("hyper_parallel.core.dtensor.random._utils")
-    def test_basic(self, mock_utils, mock_dist):
-        """Test basic."""
+    def test_uses_the_owned_device_not_the_logical_rank(self, mock_utils, mock_dist):
+        """A fake run standing for logical rank 7 must stay on its own device."""
         mock_handle = MagicMock()
+        mock_handle.current_device.return_value = 0
         mock_utils.get_device_handle.return_value = mock_handle
-        mock_dist.get_rank.return_value = 3
-        mock_utils.device_count.return_value = 2
-        mock_utils.device.return_value = "device_1"
+        mock_dist.get_rank.return_value = 7
+        mock_utils.device_count.return_value = 8
+        mock_utils.device.return_value = "device_0"
 
         result = _resolve_device()
-        # rank 3 % 2 = 1
-        mock_utils.device.assert_called_once_with(1)
-        self.assertEqual(result, "device_1")
+
+        mock_utils.device.assert_called_once_with(0)
+        mock_utils.device_count.assert_not_called()
+        self.assertEqual(result, "device_0")
+
+    @patch("hyper_parallel.core.dtensor.random._utils")
+    def test_follows_the_local_rank_binding(self, mock_utils):
+        """The tracker lives where set_device(LOCAL_RANK) put it."""
+        mock_handle = MagicMock()
+        mock_handle.current_device.return_value = 3
+        mock_utils.get_device_handle.return_value = mock_handle
+        mock_utils.device.return_value = "device_3"
+
+        result = _resolve_device()
+
+        mock_utils.device.assert_called_once_with(3)
+        self.assertEqual(result, "device_3")
 
 
 # ===========================================================================

@@ -365,5 +365,33 @@ class TestTorchStateDictUtils(unittest.TestCase):
         self.assertTrue(captured["assign"])
 
 
+class TestGetLocalDevice(unittest.TestCase):
+    """The optimizer-state staging device must be the one this process owns."""
+
+    @patch.object(state_dict_utils, "torch")
+    def test_uses_the_owned_device_not_the_logical_rank(self, mock_torch):
+        """A fake run standing for logical rank 7 must not stage on npu:7."""
+        mock_torch.npu.is_available.return_value = True
+        mock_torch.npu.current_device.return_value = 0
+        mock_torch.device.return_value = "npu:0"
+
+        result = state_dict_utils._get_local_device()
+
+        mock_torch.device.assert_called_once_with("npu", 0)
+        self.assertEqual(result, "npu:0")
+
+    @patch.object(state_dict_utils, "torch")
+    def test_follows_the_local_rank_binding(self, mock_torch):
+        """The index is set_device(LOCAL_RANK), not the global rank."""
+        mock_torch.npu.is_available.return_value = True
+        mock_torch.npu.current_device.return_value = 3
+        mock_torch.device.return_value = "npu:3"
+
+        result = state_dict_utils._get_local_device()
+
+        mock_torch.device.assert_called_once_with("npu", 3)
+        self.assertEqual(result, "npu:3")
+
+
 if __name__ == "__main__":
     unittest.main()
