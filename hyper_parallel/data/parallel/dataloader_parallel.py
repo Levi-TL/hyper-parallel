@@ -34,6 +34,15 @@ def _always_build() -> bool:
     return True
 
 
+def _is_fake_backend() -> bool:
+    """Report whether the default process group is the single-process fake one."""
+    # Imported lazily: process_role only needs torch, but the data layer is
+    # reached while hyper_parallel itself is still importing.
+    from hyper_parallel.process_role import is_fake_backend_active  # pylint: disable=C0415
+
+    return is_fake_backend_active()
+
+
 def _no_barrier() -> None:
     """Provide a no-op barrier for standalone Dataset construction."""
 
@@ -73,16 +82,15 @@ def _is_dataloader_rank(mesh_context: Any, source_rank: int) -> bool:
 
 
 def _is_global_cache_builder_rank(shared_storage: bool) -> bool:
-    """Select global rank zero as writer when Dataset caches are shared."""
+    """Select the process that writes shared Dataset caches first."""
     if not shared_storage:
         return True
 
-    try:
-        global_rank = int(dist.get_rank())
-    except (RuntimeError, ValueError):
-        global_rank = 0
-    builds_shared_cache = global_rank == 0
-    return builds_shared_cache
+    # global rank zero, or the only process of a fake run standing for another
+    # logical rank: it takes rank 0's path so both runs build the same cache.
+    from hyper_parallel.process_role import is_main_process  # pylint: disable=C0415
+
+    return is_main_process()
 
 
 def create_dataloader_parallel_context(
@@ -99,7 +107,9 @@ def create_dataloader_parallel_context(
         mesh_context: Trainer mesh state that provides TP, CP, and DP ranks.
         data_index_cache: Whether every Dataset rank may consume an existing index cache.
         tp_source_rank: TP-local source rank, or ``None`` when the loader already
-            distributes batches to all model ranks.
+            distributes batches to all model ranks. Under the fake backend a
+            non-``None`` value is downgraded to ``None``: one process cannot
+            broadcast its own batch to itself as a peer.
         shared_storage: Whether Dataset index caches are visible to every process.
         barrier: Optional Dataset-specific long-wait synchronization callback.
 
@@ -123,6 +133,19 @@ def create_dataloader_parallel_context(
     tp_size = int(getattr(mesh_context, "tp_size", 1))
     if tp_source_rank is not None and not 0 <= tp_source_rank < tp_size:
         raise ValueError("tp_source_rank must be a rank within the TP group or None")
+    if tp_source_rank is not None and tp_size > 1 and _is_fake_backend():
+        # Native loading reads on one TP rank and broadcasts the batch out.
+        # The fake backend never moves data, so a fake run standing for a
+        # non-source TP rank would train on uninitialized buffers. One process
+        # must therefore own its own input: tp_source_rank=None makes every
+        # rank read, which is what a non-source rank receives in a real run
+        # anyway (same DP/CP coordinates, same shard, same order).
+        logger.info(
+            "Fake backend: this process owns its DataLoader input; "
+            "the TP batch broadcast (tp_source_rank=%d) is skipped.",
+            tp_source_rank,
+        )
+        tp_source_rank = None
     build_on_rank = _always_build if tp_source_rank is None else partial(
         _is_dataloader_rank, mesh_context, tp_source_rank,
     )

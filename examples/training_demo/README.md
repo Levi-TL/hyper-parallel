@@ -82,7 +82,8 @@ Logs and generated data are stored under `output/training_demo`.
 `training.backend: fake` runs the **same YAML topology in one physical
 process**: kernels, allocator, weights, and data stay real, while collectives
 become local no-ops (no communicator is created). `HP_FAKE_WORLD_SIZE` pins
-the logical world size, and the process stands for logical rank 0.
+the logical world size, and `HP_FAKE_RANK` (default 0) selects which logical
+rank the process stands for, so `HP_FAKE_RANK=3` exercises rank 3's shards.
 
 ```bash
 bash examples/training_demo/qwen3_moe/run_fake.sh /path/to/Qwen3-30B-A3B
@@ -113,6 +114,13 @@ What the fake backend proves and does not:
   and therefore expert activations and exchange buffers, match a balanced EP
   run in expectation; routing imbalance between ranks and the loss value do
   not. This is the same assumption torch's fake `all_gather` makes.
+- Data is read **by the fake process itself**, not broadcast: in a real run
+  only TP rank 0 reads the batch and broadcasts it to its TP peers, but a fake
+  collective moves no data, so a non-source rank would train on uninitialized
+  buffers. The DataLoader context is therefore built with
+  `tp_source_rank=None`, and every logical rank reads its own DP/CP shard
+  (same coordinates, same shard, same order as the peer that would have
+  broadcast to it).
 
 Torch registers its fake backend for `cpu/cuda/hpu` (plus `xpu` from 2.10)
 only, while a process group resolves its backend per collective from the

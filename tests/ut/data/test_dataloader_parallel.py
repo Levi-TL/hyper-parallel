@@ -27,6 +27,7 @@ from hyper_parallel.data.parallel import (
     DataLoaderParallelContext, TPBatchBroadcaster, build_dataset_for_dataloader,
     create_dataloader_parallel_context,
 )
+from hyper_parallel.data.parallel.dataloader_parallel import _is_global_cache_builder_rank
 
 
 class _RandomRecoveryDataset(torch.utils.data.Dataset):
@@ -193,6 +194,56 @@ class TestDataLoaderParallelContext(unittest.TestCase):
                         self.assertEqual(runtime.batch_transport.call_args.args[0]["cu_seq_lens"].tolist(), [0, 3, 8])
                         self.assertEqual(model["custom_input"], 7)
                         runtime.batch_transport.assert_called_once()
+
+    def test_fake_backend_makes_every_rank_own_its_input(self):
+        """A fake run has no TP peer to receive the batch from, so it reads."""
+        mesh = SimpleNamespace(mesh_dim_names=())
+        runtime = SimpleNamespace(device_mesh=mesh, tp_size=2, tp_rank=1, cp_size=2, cp_rank=1)
+        with patch(
+            "hyper_parallel.data.parallel.dataloader_parallel.dist.get_world_size", return_value=8,
+        ), patch(
+            "hyper_parallel.data.parallel.dataloader_parallel._is_fake_backend", return_value=True,
+        ):
+            context = create_dataloader_parallel_context(
+                runtime, tp_source_rank=0, shared_storage=False,
+            )
+            factory = Mock(return_value=object())
+            dataset = build_dataset_for_dataloader(factory, context, barrier_needed=False)
+        self.assertIsNone(context.tp_source_rank)
+        self.assertTrue(context.build_on_rank())
+        self.assertEqual(factory.call_count, 1)
+        self.assertIs(dataset, factory.return_value)
+
+    def test_fake_backend_refuses_tp_batch_broadcast(self):
+        """Fail loudly instead of training on uninitialized broadcast buffers."""
+        context = DataLoaderParallelContext(tp_world_size=2, tp_group=object())
+        broadcaster = TPBatchBroadcaster(context, "cpu")
+        batch = {"input_ids": torch.arange(4).reshape(1, 4), "labels": torch.ones((1, 4))}
+        with patch(
+            "hyper_parallel.data.parallel.batch_parallel._is_fake_backend", return_value=True,
+        ), patch("hyper_parallel.data.parallel.batch_parallel.dist.broadcast") as broadcast:
+            with self.assertRaises(RuntimeError):
+                broadcaster.broadcast(batch, torch.tensor([0, 4]))
+            broadcast.assert_not_called()
+
+    def test_fake_backend_broadcast_passes_local_ownership_through(self):
+        """With tp_source_rank=None the same call becomes local-only."""
+        context = DataLoaderParallelContext(tp_source_rank=None, tp_rank=1, tp_world_size=2)
+        broadcaster = TPBatchBroadcaster(context, "cpu")
+        batch = {"input_ids": torch.arange(4).reshape(1, 4), "labels": torch.ones((1, 4))}
+        with patch(
+            "hyper_parallel.data.parallel.batch_parallel._is_fake_backend", return_value=True,
+        ), patch("hyper_parallel.data.parallel.batch_parallel.dist.broadcast") as broadcast:
+            result = broadcaster.broadcast(batch, torch.tensor([0, 4]))
+            broadcast.assert_not_called()
+        self.assertEqual(result["cu_seq_lens"].tolist(), [0, 4])
+
+    def test_fake_backend_builds_the_shared_cache_first(self):
+        """A fake run takes rank 0's cache path whatever its logical rank is."""
+        with patch("hyper_parallel.process_role.is_fake_backend_active", return_value=True):
+            self.assertTrue(_is_global_cache_builder_rank(shared_storage=True))
+        with patch("hyper_parallel.process_role.is_main_process", return_value=False):
+            self.assertFalse(_is_global_cache_builder_rank(shared_storage=True))
 
     def test_native_source_still_broadcasts(self):
         """The native source sends shape, tokens, labels and global boundaries."""

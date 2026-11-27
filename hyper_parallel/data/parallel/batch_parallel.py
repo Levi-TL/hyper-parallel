@@ -307,6 +307,15 @@ class CPBatchSharder:
         return cp_batch
 
 
+def _is_fake_backend() -> bool:
+    """Report whether the default process group is the single-process fake one."""
+    # Imported lazily: process_role only needs torch, but the data layer is
+    # reached while hyper_parallel itself is still importing.
+    from hyper_parallel.process_role import is_fake_backend_active  # pylint: disable=C0415
+
+    return is_fake_backend_active()
+
+
 class TPBatchBroadcaster:
     """Broadcast CP-local batch fields within one TP group."""
 
@@ -342,7 +351,21 @@ class TPBatchBroadcaster:
 
         Returns:
             Local batch populated on every TP rank.
+
+        Raises:
+            RuntimeError: A TP source rank is configured while the fake backend
+                is active. The broadcast is the only thing that carries the
+                batch itself, and fake collectives move no data, so a
+                non-source rank would train on uninitialized buffers.
         """
+        if self.parallel_context.tp_source_rank is not None and _is_fake_backend():
+            raise RuntimeError(
+                "The fake backend cannot broadcast the batch: this process stands "
+                "for one logical rank, but the batch is read only on TP rank "
+                f"{self.parallel_context.tp_source_rank}. Build the DataLoader "
+                "context with tp_source_rank=None so this process reads its own "
+                "input (see create_dataloader_parallel_context)."
+            )
         if broadcast_all_fields:
             parallel_batch = self._broadcast_mapping(cp_local_batch)
             return parallel_batch
