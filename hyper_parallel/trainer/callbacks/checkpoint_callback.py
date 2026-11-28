@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
+from hyper_parallel._ckpt_trace import ckpt_trace
 from hyper_parallel.components.checkpoint import build_checkpointer
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     STEP_PREFIX,
@@ -408,14 +409,22 @@ class CheckpointerCallback(Callback):
             self._save_train_state,
         )
 
+        ckpt_trace("assemble.model_begin", step=state.global_step)
         checkpoint_state: Dict[str, Any] = {"model": self._model_state_dict()}
+        ckpt_trace("assemble.model_done", step=state.global_step)
         optimizers = _as_list(self.trainer.optimizer) if self._save_optimizer else []
         if self._save_optimizer:
+            # The optimizer state dict is the one assembly step that talks to the
+            # other ranks (HSDP state broadcast), so it gets its own boundary.
+            ckpt_trace("assemble.optimizer_begin", step=state.global_step)
             checkpoint_state["optimizer"] = _unwrap_single(
                 [optimizer.state_dict() for optimizer in optimizers]
             )
+            ckpt_trace("assemble.optimizer_done", step=state.global_step)
         if self._save_train_state:
+            ckpt_trace("assemble.train_state_begin", step=state.global_step)
             checkpoint_state["extra_state"] = self._collect_extra_state(state)
+            ckpt_trace("assemble.train_state_done", step=state.global_step)
 
         external = get_model_external_state(self.trainer.model)
         if external is not None:

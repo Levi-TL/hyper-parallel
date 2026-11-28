@@ -28,6 +28,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from hyper_parallel._ckpt_trace import ckpt_trace
 from hyper_parallel.high_availability.group_registry import recovery_optimizer_subgroup
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
@@ -42,6 +43,17 @@ from hyper_parallel.core.optimizer.swap_optimizer_base import _restore_dtensor_m
 from hyper_parallel.core.optimizer.utils import empty_accelerator_cache, get_current_device, get_device_count
 
 logger = logging.getLogger(__name__)
+
+# Optimizer state is exchanged across a replicate group in float32 regardless of
+# the dtype each rank happens to keep it in. The owner of a parameter holds
+# state in the parameter's dtype (Muon allocates ``momentum_buffer`` with
+# ``zeros_like(grad)``, so bf16 for a bf16 run) while a peer that does not own
+# the parameter has no state at all. Bucketing by the local dtype therefore put
+# the two ranks of one replicate group into different buckets, with different
+# element sizes and buffer lengths, and the broadcast never matched. float32 is
+# the one choice every rank can agree on without knowing the others' state, and
+# it is lossless for every narrower dtype a checkpoint can hold.
+_STATE_BROADCAST_DTYPE = torch.float32
 
 
 class ChainedOptimizer:
@@ -213,16 +225,20 @@ class ChainedOptimizer:
             # Ensure all ranks have consistent optimizer state before snapshotting.
             for opt in self.chained_optimizers:
                 if hasattr(opt, "_broadcast_state_fused_for_ckpt"):
+                    ckpt_trace("optimizer.state_broadcast.begin", optimizer=type(opt).__name__)
                     opt._broadcast_state_fused_for_ckpt()  # pylint: disable=protected-access
+                    ckpt_trace("optimizer.state_broadcast.done", optimizer=type(opt).__name__)
 
             merged: Dict[str, Any] = {}
             for name, optimizer in self.optimizers_dict.items():
+                ckpt_trace("optimizer.state_dict.begin", optimizer=name)
                 with self._optimizer_parameter_view():
                     sd = get_optimizer_state_dict(
                         self.model,
                         optimizer,
                         options=StateDictOptions(flatten_optimizer_state_dict=self.flatten)
                     )
+                ckpt_trace("optimizer.state_dict.done", optimizer=name)
                 if optimizer in prepared:
                     # The swap lifecycle releases device storage once the
                     # checkpoint window closes, so the exported values must own
@@ -757,6 +773,12 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
     ) -> Dict[Tuple, List[torch.Tensor]]:
         """Collect tensors to broadcast, grouped by (src_coord, dtype, replicate_pgs).
 
+        ``dtype`` is the dtype of the exchange buffer, not of the local tensor:
+        parameters are bucketed by their own dtype (identical on every rank by
+        construction) and optimizer state by :data:`_STATE_BROADCAST_DTYPE`, which
+        is what keeps a rank that owns a state tensor and a rank that does not in
+        the same bucket.
+
         Args:
             target: "param" or "state".
             state_keys: State dict keys to broadcast when target="state".
@@ -775,14 +797,27 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                 param_state = self.state.setdefault(p, {})
                 for key in state_keys:
                     if key in param_state:
-                        state_tensor = param_state[key]
-                        local_tensor = to_local_if_dtensor(state_tensor)
+                        local_tensor = to_local_if_dtensor(param_state[key])
                     else:
-                        local_tensor = torch.empty_like(p, dtype=torch.float32)
-                        param_state[key] = local_tensor
-                        local_tensor = to_local_if_dtensor(local_tensor)
+                        # A rank that does not own this parameter carries no state
+                        # for it; it still has to receive the owner's copy, so the
+                        # placeholder must be sized like the owner's buffer. It is
+                        # therefore allocated in the exchange dtype below, not in
+                        # whichever dtype the local state would have had.
+                        placeholder = torch.empty_like(p, dtype=_STATE_BROADCAST_DTYPE)
+                        param_state[key] = placeholder
+                        local_tensor = to_local_if_dtensor(placeholder)
 
-                    rank_dtype_tensors[(src_coord, local_tensor.dtype, replicate_pgs)].append(local_tensor)
+                    # Bucketed by the *exchange* dtype, not by the local state's
+                    # dtype. The owner of a bf16 parameter keeps bf16 momentum
+                    # while a peer without that state falls back to float32, and
+                    # two ranks packing different element sizes into the same
+                    # replicate group issue a broadcast with mismatched counts:
+                    # HCCL then never completes, and the rank that moved on to the
+                    # next barrier is the one that reports the 507048 timeout.
+                    rank_dtype_tensors[
+                        (src_coord, _STATE_BROADCAST_DTYPE, replicate_pgs)
+                    ].append(local_tensor)
 
         return rank_dtype_tensors
 
@@ -930,6 +965,19 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         for (src_coord, dtype, replicate_pgs), tensors in rank_dtype_tensors.items():
             if not tensors:
                 continue
+
+            if target == "state":
+                # One line per bucket, per rank: the packed length and the batch
+                # count have to match across the replicate group, and the bucket
+                # list itself has to be identical on every rank. Diverging here
+                # is what turns a checkpoint save into a hung collective.
+                ckpt_trace(
+                    "optimizer.state_bucket",
+                    src=src_coord,
+                    dtype=str(dtype).replace("torch.", ""),
+                    tensors=len(tensors),
+                    numel=sum(tensor.numel() for tensor in tensors),
+                )
 
             local_coord = tuple(
                 dist.get_rank(group=pg) if pg is not None else -1

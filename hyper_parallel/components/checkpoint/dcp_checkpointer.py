@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel import SkipDTensorDispatch
+from hyper_parallel._ckpt_trace import ckpt_trace
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     FP32_MAIN_PARAM_STATE_KEY,
     MIXED_PRECISION_OPTIMIZER_STATE_KEY,
@@ -611,19 +612,25 @@ class DistributedCheckpointer(CheckpointerBase):
         # Never let two saves overlap: they would compete for host memory and,
         # in async mode, race on the checkpoint directory.
         self.maybe_wait_for_async_save()
+        ckpt_trace("save.begin", path=path, step=global_step, async_=save_async)
 
         payload = dict(state)
         extra_state = payload.pop("extra_state", None)
 
         if extra_state is not None and self.extra_state_per_rank:
             os.makedirs(os.path.join(path, _EXTRA_STATE_DIR), exist_ok=True)
+            ckpt_trace("save.pre_barrier", path=path)
             _barrier()
+            ckpt_trace("save.post_barrier", path=path)
             # Written before the shards so that every persisted model/optimizer
             # payload is already backed by the progress state to resume from it.
             torch.save(extra_state, self._extra_state_path(path, _get_rank()))
+            ckpt_trace("save.extra_state_written", path=path)
         else:
             os.makedirs(path, exist_ok=True)
+            ckpt_trace("save.pre_barrier", path=path)
             _barrier()
+            ckpt_trace("save.post_barrier", path=path)
             if extra_state is not None:
                 payload["extra_state"] = extra_state
 
@@ -644,13 +651,17 @@ class DistributedCheckpointer(CheckpointerBase):
             )
             logger.info("Async DCP save dispatched: %s", path)
         else:
+            ckpt_trace("save.dcp_begin", path=path)
             dcp_save(payload, checkpoint_id=path)
+            ckpt_trace("save.dcp_done", path=path)
             logger.info("Sync DCP save completed: %s", path)
 
         _empty_cache()
 
         if not save_async:
+            ckpt_trace("save.finalize_begin", path=path)
             self._finalize_checkpoint(path, global_step)
+            ckpt_trace("save.finalize_done", path=path)
 
     # ------------------------------------------------------------------
     # Load
